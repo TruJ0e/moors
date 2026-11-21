@@ -1,0 +1,1746 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Moors — TEST DIAG VARIANT</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#060708; overflow:hidden; }
+  #app { position:fixed; inset:0; }
+  canvas { display:block; }
+  #overlay {
+    position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    background:rgba(4,5,6,0.82); color:#9aa3a0; font-family:Georgia, 'Times New Roman', serif;
+    letter-spacing:0.35em; text-transform:uppercase; font-size:15px; cursor:pointer;
+    user-select:none; z-index:10; text-align:center;
+  }
+  #overlay.hidden { display:none; }
+  #overlay .title { font-size:34px; letter-spacing:3px; margin-bottom:10px; }
+  #overlay .hint { font-size:14px; opacity:0.75; transition: opacity 1.2s; }
+  #overlay .hint.faded { opacity:0; }
+  #overlay .sub { margin-top:18px; font-size:16px; opacity:0.9; }
+  #banner { position:fixed; top:0; left:0; right:0; display:none; background:#3d0f0f; color:#f2c9c9; font:13px monospace; padding:6px 10px; z-index:30; }
+  #banner.show { display:block; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="app"></div>
+<div id="overlay"><div class="title">Enter the Moors</div><div class="hint" id="hint">WASD / arrow keys to walk &middot; Shift to run &middot; mouse to look</div><div class="sub" id="overlaySub">Click to begin</div></div>
+<div id="banner"></div>
+<script type="module">
+import * as THREE from 'three';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+
+// SS1 diagnostics namespace: runtime errors land in window.__moors.errors
+// and raise the banner; TEST reads this namespace.
+window.__moors = window.__moors || { errors: [] };
+
+// MOORS — BUILD round 1 scaffold.
+// Frozen plan: plan v229 (SHA-256 b4fff2f67dd03029827e0a0242f835b9232ef5cf19eff854093000192956bd18).
+// Single self-contained file; the Three.js module is the only external asset (per spec).
+
+const container = document.getElementById('app');
+const overlay = document.getElementById('overlay');
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+container.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x070b12);
+// SS3.1 (C10, @gpt ruling): ONE uniform FogExp2 at the plan's density —
+// no height-fog shader patch, no time variation of the density value.
+scene.fog = new THREE.FogExp2(0x070b12, 0.0145);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.LinearToneMapping;
+renderer.toneMappingExposure = 1.0;
+
+// AM1: one locked moon direction (azimuth 35 deg, elevation 16 deg) derives
+// the light, the disc, and the halo — nothing else invents a moon position.
+const MOON_AZ = 35 * Math.PI / 180, MOON_EL = 16 * Math.PI / 180;
+const MOON_DIR = new THREE.Vector3(
+  Math.sin(MOON_AZ) * Math.cos(MOON_EL), Math.sin(MOON_EL), -Math.cos(MOON_AZ) * Math.cos(MOON_EL)).normalize();
+const moonLight = new THREE.DirectionalLight(0x9bb4d8, 0.45);
+moonLight.position.copy(MOON_DIR).multiplyScalar(300);
+scene.add(moonLight);
+// SS3.2 retained fill (C12): hemisphere light, sky #1a273b / ground #0d100e.
+scene.add(new THREE.HemisphereLight(0x1a273b, 0x0d100e, 0.18));
+
+const camera = new THREE.PerspectiveCamera(72, window.innerWidth / window.innerHeight, 0.25, 1400);
+camera.position.set(0, 2, 0);
+
+
+
+// ---- Terrain (BUILD round 2) -------------------------------------------------
+// Frozen-plan rules honored here: the heightmap is generated from a seed by a
+// pipeline that knows nothing about any placed feature (CD2); the rim that
+// closes the world is part of the height function itself (BP2); the world's
+// identity is a content-derived fingerprint over heights + parameters + seed
+// + generator version (BW2), exposed for audit as window.__MOORS_WORLD__.
+const GEN_VERSION = 'moors-terrain-gen-3';
+// SS2 (R7 conformance): seed is the plan's locked default, overridable via
+// ?seed=<int>; the world is 640x640 m on a 256x256-cell mesh (delta 2.5 m).
+// TH2 single-authority seed parse (R12 replacement for the ?seed= lines):
+// grammar ^[+-]?[0-9]+$ over the whole decoded value; duplicate seed
+// params are invalid; missing/empty/invalid selects the default silently
+// (application-side; the TEST harness asserts the effective seed itself).
+// Normalization is exact integer arithmetic (BigInt) modulo 2^32 — never
+// floating point, so thousand-digit inputs normalize exactly. Parsed ONCE
+// here; the result is the sole root of every stream derivation, and
+// window.__moors.seed reports it (set beside __MOORS_WORLD__).
+function parseSeed(search) {
+  const raw = String(search || '').replace(/^\?/, '');
+  const values = [];
+  if (raw) for (const pair of raw.split('&')) {
+    const eq = pair.indexOf('=');
+    const k = eq < 0 ? pair : pair.slice(0, eq);
+    if (k === 'seed') values.push(eq < 0 ? '' : pair.slice(eq + 1));
+  }
+  if (values.length !== 1) return 0x4D4F4F52;
+  let v;
+  try { v = decodeURIComponent(values[0].replace(/\+/g, '%20')); } catch (e) { return 0x4D4F4F52; }
+  if (!/^[+-]?[0-9]+$/.test(v)) return 0x4D4F4F52;
+  const neg = v.charAt(0) === '-';
+  const digits = v.replace(/^[+-]/, '');
+  let n = BigInt(digits) % 4294967296n;
+  if (neg) n = (4294967296n - n) % 4294967296n;
+  return Number(n);
+}
+const EFFECTIVE_SEED = parseSeed(typeof location !== 'undefined' ? location.search : '');
+const WORLD = {
+  seed: EFFECTIVE_SEED,
+  size: 640,          // world is size x size metres, centred on origin
+  segments: 256
+};
+
+function hash2(ix, iz, seed) {
+  // Integer hash with LOGICAL shifts — an arithmetic-shift xorshift can never
+  // set the top bit (bit31 ^ bit31 = 0), which capped the old version at 0.5
+  // and starved every noise-driven system (found in BUILD round 4, TT2-B4-06).
+  let h = Math.imul(ix, 374761393) + Math.imul(iz, 668265263) + Math.imul(seed, 974634211);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  h ^= h >>> 16;
+  return (h >>> 0) / 4294967296;
+}
+function smooth(t) { return t * t * t * (t * (t * 6 - 15) + 10); } // quintic Hermite (SS2)
+function valueNoise(x, z, seed) {
+  const ix = Math.floor(x), iz = Math.floor(z);
+  const fx = x - ix, fz = z - iz;
+  const a = hash2(ix, iz, seed), b = hash2(ix + 1, iz, seed);
+  const c = hash2(ix, iz + 1, seed), d = hash2(ix + 1, iz + 1, seed);
+  const ux = smooth(fx), uz = smooth(fz);
+  return a + (b - a) * ux + (c - a) * uz + (a - b - c + d) * ux * uz;
+}
+function fbm(x, z, seed, octaves = 5) {
+  let sum = 0, amp = 1, freq = 1, norm = 0;
+  for (let o = 0; o < octaves; o++) {
+    sum += amp * valueNoise(x * freq, z * freq, seed + o * 101);
+    norm += amp;
+    amp *= 0.5; freq *= 2.1;
+  }
+  return sum / norm; // 0..1
+}
+// The one height function: geometry, camera, and collision all read this.
+// SS2 construction (R7): domain warp first (two octaves, lambda ~180 m,
+// +/-18 m), then three bands — broad fells (lambda 140-220 m, amp 14-18),
+// peat hags (lambda 35-70 m, amp 2.5-4.5), tussock micro-relief
+// (lambda 6-16 m, amp 0.20-0.55) — then the spawn clearing flatten
+// (unwarped coordinates; G5: the target plane descends toward the circle).
+const CIRCLE_DIR = (() => { const l = Math.hypot(45, -105); return { x: 45 / l, z: -105 / l }; })();
+function terrainHeight(x, z) {
+  const wx = (fbm(x / 180 + 13.1, z / 180 + 7.7, WORLD.seed + 31, 2) - 0.5) * 36;
+  const wz = (fbm(x / 180 + 3.9, z / 180 + 21.3, WORLD.seed + 47, 2) - 0.5) * 36;
+  const px = x + wx, pz = z + wz;
+  let h = (fbm(px / 180 + 31.7, pz / 180 + 11.3, WORLD.seed, 5) - 0.5) * 2 * 16
+        + (fbm(px / 50 + 7.9, pz / 50 + 3.1, WORLD.seed + 77, 3) - 0.5) * 2 * 3.5
+        + (fbm(px / 11 + 51.3, pz / 11 + 27.9, WORLD.seed + 111, 2) - 0.5) * 2 * 0.375;
+  // BP1/BP2 border country (C08, R10): a radial rise inside the leash zone
+  // so SS5 slope discipline closes the world topologically — proven by a
+  // flood-fill over GRID under the TR4 slope definition (build log rB10).
+  // Constants pinned in the conformance register; M14 leash is the backstop.
+  const br = Math.hypot(x, z);
+  if (br > 230) { const bt = Math.min(1, (br - 230) / 55); h += 48 * (bt * bt * (3 - 2 * bt)); }
+  const r = Math.hypot(x, z);
+  if (r < 28) {
+    const target = -Math.tan(1.5 * Math.PI / 180) * (x * CIRCLE_DIR.x + z * CIRCLE_DIR.z);
+    const t = THREE.MathUtils.clamp((r - 12) / 16, 0, 1);
+    const w = t * t * (3 - 2 * t);
+    h = target + (h - target) * w;
+  }
+  return h;
+}
+function worldFingerprint() {
+  // FNV-1a over quantized sample heights + generation parameters (BW2).
+  let h = 0x811c9dc5;
+  const mix = (s) => { for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); } };
+  mix(GEN_VERSION + '|' + WORLD.seed + '|' + WORLD.size + '|' + WORLD.segments + '|');
+  const half = WORLD.size / 2;
+  for (let gx = -half; gx <= half; gx += 16) {
+    for (let gz = -half; gz <= half; gz += 16) {
+      mix(groundHeight(gx, gz).toFixed(3) + ',');
+    }
+  }
+  return ('0000000' + (h >>> 0).toString(16)).slice(-8);
+}
+
+// The height grid the mesh is built from (SS2): the custom geometry's
+// vertices ARE this array, and groundHeight() interpolates it with the same
+// diagonal the index buffer uses — mesh, physics, and camera share one
+// surface (C33). terrainHeight() remains the generation authority.
+const GRID = (() => {
+  const n = WORLD.segments + 1, half = WORLD.size / 2, step = WORLD.size / WORLD.segments;
+  const g = new Float32Array(n * n);
+  for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) g[j * n + i] = terrainHeight(-half + i * step, -half + j * step);
+  return { g, n, half, step };
+})();
+function groundHeight(x, z) {
+  // SS2 exact interpolation: u=(x+320)/2.5, v=(z+320)/2.5; fu>=fv selects the
+  // upper-right triangle (a,b,d), fu<fv the lower-left (a,d,c), split along
+  // the (x0,z0)-(x1,z1) diagonal — the same split the mesh index buffer uses.
+  const { g, n, half, step } = GRID;
+  // G8 precise form: clamp to the inclusive domain first; on the
+  // positive boundary the cell is 255 with fraction exactly 1, so
+  // out-of-domain queries return exactly the boundary result.
+  const fx = THREE.MathUtils.clamp((x + half) / step, 0, WORLD.segments);
+  const fz = THREE.MathUtils.clamp((z + half) / step, 0, WORLD.segments);
+  let i = Math.floor(fx), j = Math.floor(fz);
+  if (i >= WORLD.segments) i = WORLD.segments - 1;
+  if (j >= WORLD.segments) j = WORLD.segments - 1;
+  const fu = fx - i, fv = fz - j;
+  const a = g[j * n + i], b = g[j * n + i + 1], c = g[(j + 1) * n + i], d = g[(j + 1) * n + i + 1];
+  if (fu >= fv) return a + (b - a) * fu + (d - b) * fv;
+  return a + (d - c) * fu + (c - a) * fv;
+}
+
+window.__MOORS_WORLD__ = { seed: WORLD.seed, gen: GEN_VERSION, fingerprint: worldFingerprint(), params: Object.assign({}, WORLD) };
+window.__moors.seed = WORLD.seed; // TH2: the single-authority effective seed
+window.__moors.diagnostics = { fogDensity: 0.0145, hemisphereIntensity: 0.18, moonIntensity: 0.45, gen: GEN_VERSION, fingerprint: window.__MOORS_WORLD__.fingerprint }; // AT2/AT5
+
+// TR4: slope has ONE definition — the gradient of GRID by central
+// differences, expressed as an angle. Placement, movement admissibility,
+// and every audit read this function.
+function gridSlope(x, z) {
+  const { g, n, half, step } = GRID;
+  let i = Math.round((x + half) / step), j = Math.round((z + half) / step);
+  i = Math.min(n - 2, Math.max(1, i)); j = Math.min(n - 2, Math.max(1, j));
+  const gx = (g[j * n + i + 1] - g[j * n + i - 1]) / (2 * step);
+  const gz = (g[(j + 1) * n + i] - g[(j - 1) * n + i]) / (2 * step);
+  const mag = Math.hypot(gx, gz);
+  return { gx, gz, mag, angleDeg: Math.atan(mag) * 180 / Math.PI };
+}
+
+const terrainGeo = (() => {
+  // Custom indexed geometry (SS2): vertices ARE the GRID; every cell splits
+  // along (x0,z0)-(x1,z1) via triangles (a,d,b) and (a,c,d) — winding chosen
+  // so face normals point +Y (cross products verified in the R7 harness).
+  const n = GRID.n, half = GRID.half, step = GRID.step;
+  const posArr = new Float32Array(n * n * 3);
+  const colArr = new Float32Array(n * n * 3);
+  const heather = new THREE.Color(0x3b263d);   // SS3.6 palette
+  const moss = new THREE.Color(0x242b1e);      // moor grass
+  const peat = new THREE.Color(0x2e241d);
+  const rock = new THREE.Color(0x55565a);
+  const tmp = new THREE.Color();
+  for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
+    const k = j * n + i, x = -half + i * step, z = -half + j * step, y = GRID.g[k];
+    posArr[k * 3] = x; posArr[k * 3 + 1] = y; posArr[k * 3 + 2] = z;
+    const t = THREE.MathUtils.clamp((y + 20) / 46, 0, 1);
+    const patch = fbm(x * 0.06 + 91.2, z * 0.06 + 47.8, WORLD.seed + 5);
+    tmp.copy(moss).lerp(peat, THREE.MathUtils.clamp(patch * 1.4 - 0.2, 0, 1));
+    if (patch > 0.62) tmp.lerp(heather, THREE.MathUtils.clamp((patch - 0.62) * 2.2, 0, 0.8));
+    if (t > 0.78) tmp.lerp(rock, (t - 0.78) * 2.4);
+    // SS3.4 hollow AO per AT6: ground below the mean of its four 2.5 m
+    // neighbours darkens.
+    if (i >= 1 && i < n - 1 && j >= 1 && j < n - 1) {
+      const avg = (GRID.g[k - 1] + GRID.g[k + 1] + GRID.g[k - n] + GRID.g[k + n]) / 4;
+      const depth = avg - y;
+      if (depth > 0.4) tmp.multiplyScalar(1 - Math.min(0.25, (depth - 0.4) * 0.15));
+    }
+    colArr[k * 3] = tmp.r; colArr[k * 3 + 1] = tmp.g; colArr[k * 3 + 2] = tmp.b;
+  }
+  const idx = new Uint32Array(WORLD.segments * WORLD.segments * 6);
+  let q = 0;
+  for (let j = 0; j < WORLD.segments; j++) for (let i = 0; i < WORLD.segments; i++) {
+    const a = j * n + i, b = a + 1, c = a + n, d = c + 1;
+    idx[q++] = a; idx[q++] = d; idx[q++] = b;
+    idx[q++] = a; idx[q++] = c; idx[q++] = d;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(colArr, 3));
+  geo.setIndex(new THREE.BufferAttribute(idx, 1));
+  geo.computeVertexNormals();
+  return geo;
+})();
+const terrain = new THREE.Mesh(terrainGeo, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1, metalness: 0 }));
+scene.add(terrain);
+
+const EYE = 1.7;
+camera.position.set(0, groundHeight(0, 0) + EYE, 0);
+
+
+// ---- Atmosphere (BUILD round 3) ----------------------------------------------
+// Frozen-plan rules: the moon is the only real light; fog parameters never vary
+// with world position (BQ2/BX2) — the mist breathes over TIME only, uniformly,
+// everywhere. Stars and moon ignore fog (they are the sky, BA2 continuity).
+function radialTexture(inner, outer) {
+  const c = document.createElement('canvas'); c.width = c.height = 128;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(64, 64, 4, 64, 64, 64);
+  g.addColorStop(0, inner); g.addColorStop(1, outer);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, 128, 128);
+  const t = new THREE.CanvasTexture(c); return t;
+}
+// Moon disc + halo (SS3.2): disc radius ~29.8 m at 950 m along MOON_DIR;
+// halo is a FIXED plane perpendicular to the light vector (AW1) — never a
+// camera-facing sprite.
+const skyGroup = new THREE.Group();
+scene.add(skyGroup);
+const moonDisc = new THREE.Mesh(
+  new THREE.CircleGeometry(29.8, 40),
+  new THREE.MeshBasicMaterial({ color: 0xdbe8ff, fog: false })
+);
+moonDisc.position.copy(MOON_DIR).multiplyScalar(950);
+moonDisc.lookAt(0, 0, 0);
+skyGroup.add(moonDisc);
+moonDisc.renderOrder = -1; moonDisc.material.depthTest = true; // AT4: sky renders strictly before opaque
+const moonGlow = new THREE.Mesh(
+  new THREE.PlaneGeometry(210, 210),
+  new THREE.MeshBasicMaterial({
+    map: radialTexture('rgba(168,190,224,0.5)', 'rgba(168,190,224,0)'),
+    fog: false, transparent: true, depthWrite: false,
+    blending: THREE.AdditiveBlending, side: THREE.DoubleSide
+  })
+);
+moonGlow.position.copy(MOON_DIR).multiplyScalar(940);
+moonGlow.lookAt(moonGlow.position.clone().add(MOON_DIR));
+skyGroup.add(moonGlow);
+moonGlow.renderOrder = -1; moonGlow.material.depthTest = true; // AT4: sky renders strictly before opaque
+
+// Stars (SS3.3): 1,200 points on a 1,000 m dome, 1-2 px, Milky Way band;
+// brightness fades toward the horizon via vertex colours.
+{
+  const N = 1200, posArr = new Float32Array(N * 3), colArr = new Float32Array(N * 3);
+  const starRng = mulberry32(WORLD.seed ^ 0x53544152); // S-stream: stars are seeded like everything else (rB30; found by @gemini R29)
+  const bandNormal = new THREE.Vector3(0.35, 0.55, 0.76).normalize();
+  const v = new THREE.Vector3();
+  let placed = 0, guard = 0;
+  while (placed < N && guard++ < N * 40) {
+    v.set(starRng() * 2 - 1, starRng() * 2 - 1, starRng() * 2 - 1);
+    if (v.lengthSq() > 1 || v.lengthSq() < 0.05) continue;
+    v.normalize();
+    if (v.y < 0.08) continue;                       // fade floor (SS3.3)
+    if (Math.abs(v.dot(bandNormal)) > 0.16 && starRng() > 0.12) continue; // the band
+    posArr[placed * 3] = v.x * 1000; posArr[placed * 3 + 1] = v.y * 1000; posArr[placed * 3 + 2] = v.z * 1000;
+    const b = 0.25 + 0.75 * Math.min(1, (v.y - 0.08) / 0.3);
+    colArr[placed * 3] = 0.68 * b; colArr[placed * 3 + 1] = 0.74 * b; colArr[placed * 3 + 2] = 0.82 * b;
+    placed++;
+  }
+  const starGeo = new THREE.BufferGeometry();
+  starGeo.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
+  starGeo.setAttribute('color', new THREE.BufferAttribute(colArr, 3));
+  const stars = new THREE.Points(starGeo, new THREE.PointsMaterial({
+    vertexColors: true, size: 1.6, sizeAttenuation: false, fog: false, transparent: true, opacity: 0.85, depthWrite: false
+  }));
+  skyGroup.add(stars);
+stars.renderOrder = -1; stars.material.depthTest = true; // AT4
+}
+
+// Horizon skirt (SS2, C07): concentric square rings expanding from the mesh
+// perimeter to a 990 m half-size (corners reach the 1,400 m far plane). Ring 0
+// IS the main mesh's perimeter — the same 1,024 boundary vertices at the same
+// coordinates and heights — so the two surfaces share exact vertices as the
+// plan requires; outward rings sample terrainHeight with relief attenuation.
+{
+  const PER = []; // the mesh perimeter loop: 256 steps per side, corners once
+  for (let i = 0; i < 256; i++) PER.push([-320 + i * 2.5, -320]);
+  for (let j = 0; j < 256; j++) PER.push([320, -320 + j * 2.5]);
+  for (let i = 0; i < 256; i++) PER.push([320 - i * 2.5, 320]);
+  for (let j = 0; j < 256; j++) PER.push([-320, 320 - j * 2.5]);
+  const RINGS = 12, S0 = 320, S1 = 990;
+  const verts = [], idx = [];
+  for (let ring = 0; ring <= RINGS; ring++) {
+    const half = S0 + (S1 - S0) * (ring / RINGS) * (ring / RINGS);
+    const atten = ring === 0 ? 1 : 1 - 0.85 * (ring / RINGS);
+    for (const [bx, bz] of PER) {
+      const x = bx / 320 * half, z = bz / 320 * half;
+      verts.push(x, terrainHeight(x, z) * atten, z);
+    }
+  }
+  const W = PER.length;
+  for (let ring = 0; ring < RINGS; ring++) for (let s = 0; s < W; s++) {
+    const a = ring * W + s, b = ring * W + (s + 1) % W, c = a + W, d = b + W;
+    idx.push(a, c, b, b, c, d);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(verts), 3));
+  geo.setIndex(idx);
+  geo.computeVertexNormals();
+  const skirt = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: 0x0d1117 }));
+  scene.add(skirt);
+}
+
+// Mist banks (SS3.5 Tier 0): 16 HORIZONTAL planes, footprint-sampled
+// placement over groundHeight (center + 4 cardinal samples at 0.4 x radius;
+// reject relief > 2.2 m or above-median sites), fog-lit material, slow
+// westerly drift with far-side wrap. No billboards, no random heights.
+const mistTex = radialTexture('rgba(255,255,255,0.85)', 'rgba(255,255,255,0)');
+const mistMat = new THREE.MeshBasicMaterial({
+  color: 0x0b111c, map: mistTex, transparent: true, opacity: 0.14,
+  depthWrite: false, fog: true, side: THREE.DoubleSide
+});
+const mistRng = mulberry32(WORLD.seed ^ 0x51f15e);
+const GRID_MEDIAN = (() => {
+  const s = [];
+  for (let k = 0; k < GRID.g.length; k += 613) s.push(GRID.g[k]);
+  s.sort((a, b) => a - b);
+  return s[Math.floor(s.length / 2)];
+})();
+function mistFootprintY(x, z, radius) {
+  const pts = [[x, z], [x + radius * 0.4, z], [x - radius * 0.4, z], [x, z + radius * 0.4], [x, z - radius * 0.4]]
+    .map(([px, pz]) => groundHeight(px, pz));
+  const sorted = [...pts].sort((a, b) => a - b);
+  if (sorted[4] - sorted[0] > 2.2) return null;      // relief rule
+  if (pts[0] > GRID_MEDIAN) return null;             // low ground only
+  return Math.max(pts[0] + 0.55, sorted[3] + 0.25);  // centre vs p75 rule
+}
+const mistBanks = [];
+for (let i = 0; i < 16; i++) {
+  const size = 40 + mistRng() * 35;
+  let x = 0, z = 0, y = null, fallbackCand = null;
+  for (let attempt = 0; attempt < 60 && y === null; attempt++) {
+    x = (mistRng() * 2 - 1) * 280; z = (mistRng() * 2 - 1) * 280;
+    if (Math.hypot(x, z) - size / 2 < 28) continue; // D6: no mist footprint in the spawn clearing
+    y = mistFootprintY(x, z, size / 2);
+    if (y === null && !fallbackCand) fallbackCand = { x, z };
+  }
+  if (y === null) { // fallback: the D6 clearing rule is re-checked explicitly on this path too (rB26)
+    let fb = fallbackCand || { x: 150, z: 150 };
+    if (Math.hypot(fb.x, fb.z) - size / 2 < 28) fb = { x: 150, z: 150 };
+    x = fb.x; z = fb.z; y = groundHeight(x, z) + 0.55; }
+  const geo = new THREE.PlaneGeometry(size, size);
+  geo.rotateX(-Math.PI / 2);
+  const m = new THREE.Mesh(geo, mistMat);
+  m.position.set(x, y, z);
+  m.rotation.set((mistRng() - 0.5) * 0.06, mistRng() * Math.PI, (mistRng() - 0.5) * 0.06); // tilt <= ~3 deg
+  m.renderOrder = 2;
+  m.userData = { speed: 0.12 + mistRng() * 0.18, radius: size / 2 };
+  mistBanks.push(m); scene.add(m);
+}
+// AT7: fixed significance ranking — all banks share opacity, so
+// significance is footprint radius, descending, stable for ties. A
+// tier's active set is the top-N of this ranking; deactivation never
+// renumbers, reorders, reseeds, or repositions retained banks.
+const mistRankPos = new Array(mistBanks.length);
+mistBanks.map((b, i) => i)
+  .sort((a, b) => mistBanks[b].userData.radius - mistBanks[a].userData.radius)
+  .forEach((bankIdx, rank) => { mistRankPos[bankIdx] = rank; });
+window.__MOORS_MISTRANK__ = mistRankPos.slice();
+
+
+// ---- Detail (BUILD round 9 — conformance repair C18-C22) ----------------------
+// Placement reads ONLY terrain properties (height, slope, noise fields) plus
+// the plan's own locked coordinates (the stone circle, SS4/A6). Every feature
+// is recorded with a reason code in window.__MOORS_PLACEMENTS__; wall runs and
+// collider-source data are exported for the R10 collision rebuild.
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const detailRng = mulberry32(WORLD.seed ^ 0x9e3779b9);
+// DL2: per-item variation streams seeded by (seed, kind, index) — any
+// item's variation is reproducible from its index alone, never from a
+// shared sequential stream. Kinds: stone 1, tree 2, rock 3, tuft 4.
+function itemSeed(kind, index) {
+  let h = (WORLD.seed ^ Math.imul(kind, 0x9e3779b9)) >>> 0;
+  h = Math.imul(h ^ (index + 1), 0x85ebca6b); h ^= h >>> 13;
+  return h >>> 0;
+}
+function itemRng(kind, index) { return mulberry32(itemSeed(kind, index)); }
+const slopeAt = (x, z) => gridSlope(x, z).mag; // TR4: one slope definition
+const placements = [];
+const colliders = []; // interim circles — R10 rebuilds per M13 (capsules, <=99)
+const wallRubble = []; // wall gap/end rubble — SS4: rendered via the ROCK mesh
+
+// DL4: contact darkening is baked into the terrain vertex colours —
+// radius = footprint + 0.4 m, smooth falloff, same pass family as the
+// SS3.4 hollow AO. No decal geometry, no extra draw calls.
+const contactItems = [];
+function contactRing(x, z, r) { contactItems.push({ x, z, r }); }
+function bakeContactDarkening() {
+  const attr = terrainGeo.getAttribute('color');
+  const pos = terrainGeo.getAttribute('position');
+  for (let v = 0; v < attr.count; v++) {
+    const x = pos.getX(v), z = pos.getZ(v);
+    let f = 0;
+    for (const it of contactItems) {
+      const dx = x - it.x, dz = z - it.z;
+      if (Math.abs(dx) > it.r || Math.abs(dz) > it.r) continue;
+      const d = Math.hypot(dx, dz);
+      if (d < it.r) { const t = 1 - d / it.r, s = t * t * (3 - 2 * t); if (s > f) f = s; }
+    }
+    if (f > 0) { const m = 1 - 0.30 * f; attr.setXYZ(v, attr.getX(v) * m, attr.getY(v) * m, attr.getZ(v) * m); }
+  }
+  attr.needsUpdate = true;
+}
+
+const stoneMat = new THREE.MeshStandardMaterial({ color: 0x6a6a6e, roughness: 1 });
+const barkMat = new THREE.MeshStandardMaterial({ color: 0x2c2622, roughness: 1 });
+const tuftMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1, side: THREE.DoubleSide });
+
+// ---- C18: the standing-stone circle (SS4/A6 — centre LOCKED at (45,-105)) ----
+const CIRCLE = { x: 45, z: -105, ringR: 16 };
+const landmarkPos = { x: CIRCLE.x, z: CIRCLE.z, h: groundHeight(CIRCLE.x, CIRCLE.z) };
+const nearLandmark = (x, z, r) => (x - CIRCLE.x) ** 2 + (z - CIRCLE.z) ** 2 < r * r;
+{
+  // Positions: centre + R*(sin a, cos a). The direction from the centre back
+  // toward spawn is angle (approach + PI) in this convention, where
+  // approach = atan2(cx, cz) points from spawn to the centre. The entrance
+  // gap centres on the SPAWN-facing arc; its two flanking stones are
+  // jitter-clamped so their chord stays >= 5.5 m (rB6-gpt C18 note).
+  const approach = Math.atan2(CIRCLE.x, CIRCLE.z);
+  const gapAngle = approach + Math.PI;
+  const gapHalfAngle = Math.asin(5.5 / 2 / CIRCLE.ringR) + 0.06; // flanker separation >= ~21 deg
+  const stones = [];
+  const heights = [];
+  const stoneRngs = [];
+  for (let k = 0; k < 10; k++) { stoneRngs.push(itemRng(1, k)); heights.push(2.2 + stoneRngs[k]() * 1.6); }
+  const tallest = Math.max(...heights);
+  for (let k = 0; k < 10; k++) {
+    const a = gapAngle + (k + 0.5) * (Math.PI * 2 / 10) + (stoneRngs[k]() - 0.5) * (12 * Math.PI / 180);
+    stones.push({ a, h: heights[k] });
+  }
+  // enforce the gap: separation between stone 9 and stone 0 across gapAngle
+  const sep = (stones[0].a - stones[9].a + Math.PI * 2) % (Math.PI * 2);
+  if (sep < gapHalfAngle * 2) {
+    stones[0].a = gapAngle + gapHalfAngle;
+    stones[9].a = gapAngle - gapHalfAngle;
+  }
+  // DL2: each stone's gritstone vertex jitter comes from its own
+  // (seed, 'stone', index) stream; vertical colour: damp collar at the
+  // base, lichen tint near the top (SS4).
+  function makeStoneGeo(jr) {
+    const geo = new THREE.BoxGeometry(1, 1, 1, 1, 3, 1);
+    const posA = geo.attributes.position;
+    const colA = new Float32Array(posA.count * 3);
+    const damp = new THREE.Color(0x3f4145), mid = new THREE.Color(0x6a6a6e), lich = new THREE.Color(0x77755f);
+    const tmpC = new THREE.Color();
+    for (let vi = 0; vi < posA.count; vi++) {
+      const vy = posA.getY(vi);
+      if (Math.abs(posA.getX(vi)) === 0.5) posA.setX(vi, posA.getX(vi) * (0.82 + jr() * 0.2));
+      if (Math.abs(posA.getZ(vi)) === 0.5) posA.setZ(vi, posA.getZ(vi) * (0.82 + jr() * 0.2));
+      const t = vy + 0.5;
+      tmpC.copy(t < 0.22 ? damp : mid);
+      if (t > 0.75) tmpC.lerp(lich, (t - 0.75) * 1.6);
+      colA[vi * 3] = tmpC.r; colA[vi * 3 + 1] = tmpC.g; colA[vi * 3 + 2] = tmpC.b;
+    }
+    geo.setAttribute('color', new THREE.BufferAttribute(colA, 3));
+    geo.computeVertexNormals();
+    return geo;
+  }
+  const stoneMatV = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1 });
+  const stoneMeshes = []; // D6 audit input (burial recalculation)
+  const up = new THREE.Vector3(0, 1, 0);
+  stones.forEach((s, k) => {
+    const srng = stoneRngs[k];
+    const x = CIRCLE.x + Math.sin(s.a) * CIRCLE.ringR, z = CIRCLE.z + Math.cos(s.a) * CIRCLE.ringR;
+    const w = 0.8 + srng() * 0.5;
+    const buried = s.h * 0.15;
+    const m = new THREE.Mesh(makeStoneGeo(srng), stoneMatV);
+    m.scale.set(w, s.h + buried, w * (0.75 + srng() * 0.3));
+    const lean = srng() * 4 * Math.PI / 180, leanAxis = new THREE.Vector3(srng() - 0.5, 0, srng() - 0.5).normalize();
+    m.quaternion.setFromAxisAngle(up, srng() * Math.PI * 2);
+    if (lean > 0.005) m.quaternion.multiply(new THREE.Quaternion().setFromAxisAngle(leanAxis, lean));
+    m.position.set(x, groundHeight(x, z) + (s.h + buried) / 2 - buried, z);
+    scene.add(m); stoneMeshes.push(m);
+    const cr = w * 0.72 + Math.sin(lean) * s.h; // footprint + lean projection (M13)
+    colliders.push({ kind: 'standing-stone', x, z, r: cr });
+    placements.push({ kind: 'standing-stone', x: +x.toFixed(1), z: +z.toFixed(1), why: 'ss4-ring', h: +s.h.toFixed(2) });
+    contactRing(x, z, w + 0.5);
+  });
+  // the outlier: 20-23 m out, 22-32 deg off the approach axis, 1.15x tallest
+  {
+    const orng = itemRng(1, 10); // DL2: the outlier is stone index 10
+    const side = orng() > 0.5 ? 1 : -1;
+    const a = approach + side * (22 + orng() * 10) * Math.PI / 180;
+    const r = 20 + orng() * 3;
+    const x = CIRCLE.x + Math.sin(a) * r, z = CIRCLE.z + Math.cos(a) * r;
+    const h = tallest * 1.15, w = 1.0 + orng() * 0.4, buried = h * 0.15;
+    const m = new THREE.Mesh(makeStoneGeo(orng), stoneMatV);
+    m.scale.set(w, h + buried, w * 0.8);
+    m.quaternion.setFromAxisAngle(up, orng() * Math.PI * 2);
+    m.position.set(x, groundHeight(x, z) + (h + buried) / 2 - buried, z);
+    scene.add(m);
+    colliders.push({ kind: 'standing-stone', x, z, r: w * 0.72 });
+    stoneMeshes.push(m);
+        placements.push({ kind: 'standing-stone', x: +x.toFixed(1), z: +z.toFixed(1), why: 'ss4-outlier', h: +h.toFixed(2) });
+  window.__MOORS_STONEMESHES__ = stoneMeshes;
+    contactRing(x, z, w + 0.5);
+  }
+  placements.push({ kind: 'landmark', x: CIRCLE.x, z: CIRCLE.z, why: 'ss4-locked-centre' });
+}
+
+// ---- C21: dry-stone walls — 550 blocks on winding polylines (SS4/DS1/DS2) ----
+const wallRunsExport = [];
+{
+  // Path generation: contour walks (round-4 walker, trail rule from
+  // TT2-B4-07), recording centre points; ~52 m target length each.
+  function contourPath(targetH) {
+    let start = null;
+    for (let tries = 0; tries < 500 && !start; tries++) {
+      const x = (detailRng() * 2 - 1) * 205, z = (detailRng() * 2 - 1) * 205;
+      if (Math.abs(groundHeight(x, z) - targetH) < 0.8 && !nearLandmark(x, z, 22)) start = { x, z };
+    }
+    if (!start) return null;
+    const pts = [[start.x, start.z]];
+    let { x, z } = start, heading = detailRng() * Math.PI * 2;
+    const trail = [];
+    let length = 0;
+    while (length < 52) {
+      const gx = (groundHeight(x + 1.5, z) - groundHeight(x - 1.5, z)) / 3;
+      const gz = (groundHeight(x, z + 1.5) - groundHeight(x, z - 1.5)) / 3;
+      let tx = -gz, tz = gx; // contour direction
+      const tl = Math.hypot(tx, tz) || 1; tx /= tl; tz /= tl;
+      if (tx * Math.cos(heading) + tz * Math.sin(heading) < 0) { tx = -tx; tz = -tz; }
+      const nx = x + tx * 1.15, nz = z + tz * 1.15;
+      if (Math.max(Math.abs(nx), Math.abs(nz)) > 250) break;
+      if (trail.some(([px, pz]) => (px - nx) ** 2 + (pz - nz) ** 2 < 1.1 * 1.1)) break;
+      trail.push([nx, nz]); if (trail.length > 8) trail.shift();
+      x = nx; z = nz; heading = Math.atan2(tz, tx);
+      pts.push([x, z]); length += 1.15;
+    }
+    return pts.length > 12 ? pts : null;
+  }
+  function resample(pts, step) {
+    const out = [pts[0]];
+    let acc = 0;
+    for (let i = 1; i < pts.length; i++) {
+      let [ax, az] = out[out.length - 1]; const [bx, bz] = pts[i];
+      let d = Math.hypot(bx - ax, bz - az);
+      while (acc + d >= step) {
+        const t = (step - acc) / d;
+        ax = ax + (bx - ax) * t; az = az + (bz - az) * t;
+        out.push([ax, az]);
+        d = Math.hypot(bx - ax, bz - az); acc = 0;
+      }
+      acc += d;
+    }
+    return out;
+  }
+  const wallColumns = [];
+  const blockGeo = new THREE.BoxGeometry(1.05, 0.45, 0.48); // D2: courses stand 0.90 / 1.30 m
+  const transforms = []; // course blocks only — SS4: pitch/roll zero, yaw on tangent
+  // (wallRubble is declared at section scope — the rock mesh consumes it)
+
+  const targets = [-4.6, -3.0, -1.4, 0.2, 1.6, 3.0];
+  let targetIdx = 0, pathCount = 0;
+  while (transforms.length < 550 && pathCount < 6 && targetIdx < targets.length) {
+    const raw = contourPath(targets[targetIdx++]);
+    if (!raw) continue;
+    pathCount++;
+    const path = resample(raw, 1.02);
+    // gaps: two per path (DS1 — a gap or a collapsed end, never a cut)
+    const totalLen = (path.length - 1) * 1.02;
+    const gaps = [0.22 + detailRng() * 0.15, 0.58 + detailRng() * 0.18].map(f => {
+      const c = f * totalLen; const w = 2 + detailRng() * 2;
+      return { from: c - w / 2, to: c + w / 2 };
+    });
+    const runs = []; let curRunStart = null;
+    const closeRun = (endIdx) => { if (curRunStart !== null && endIdx >= curRunStart) runs.push({ a: curRunStart, b: endIdx }); curRunStart = null; };
+    placements.push({ kind: 'wall-path', x: +path[0][0].toFixed(1), z: +path[0][1].toFixed(1), why: 'ss4-polyline', len: +totalLen.toFixed(1) });
+    // DL4: wall contact darkening is baked, not a ribbon mesh
+    for (const [px, pz] of path) contactRing(px, pz, 1.1);
+    // lay blocks
+    let prevFound = null, runStart = 0;
+    for (let i = 0; i < path.length; i++) {
+      const distAlong = i * 1.02;
+      const [px, pz] = path[i];
+      if (gaps.some(g => distAlong >= g.from && distAlong <= g.to)) { closeRun(i - 1); prevFound = null; continue; }
+      const found = groundHeight(px, pz);
+      if (prevFound !== null && Math.abs(found - prevFound) > 0.28) { closeRun(i - 1); prevFound = null; runStart = i; continue; } // SS4 step rule -> break
+      if (curRunStart === null) curRunStart = i;
+      const [qx, qz] = path[Math.min(i + 1, path.length - 1)];
+      const yaw = Math.atan2(qz - pz, qx - px);
+      const courses = 2 + (detailRng() < 0.7 ? 1 : 0);
+      const col = { x: px, z: pz, found, yaw: -yaw, courses, blocks: [] };
+      for (let c = 0; c < courses; c++) {
+        const coping = c === 2; // D2: third course is a coping course (x0.889 in Y) so 3 courses total 1.30 m, 2 courses 0.90 m
+        const b = { x: px + (detailRng() - 0.5) * 0.05, y: coping ? found + 1.10 : found + 0.225 + c * 0.45, z: pz + (detailRng() - 0.5) * 0.05, yaw: -yaw + (detailRng() - 0.5) * 0.07, s: 0.92 + detailRng() * 0.2, sy: coping ? 0.889 : 1, rubble: false };
+        col.blocks.push(b); transforms.push(b);
+      }
+      wallColumns.push(col);
+      prevFound = found;
+      // interim collider samples along intact runs (R10 replaces with capsules)
+      if (i % 2 === 0) colliders.push({ kind: 'wall-sample', x: px, z: pz, r: 0.55 });
+    }
+    closeRun(path.length - 1);
+    wallRunsExport.push({ points: path, gaps, runs });
+    // rubble at each gap (DS1 collapsed material at breaks)
+    for (const g of gaps) {
+      const n = 4 + Math.floor(detailRng() * 3);
+      for (let k = 0; k < n; k++) {
+        const span = g.to - g.from; // DO1: rubble only in the outer 20% zones
+        const d = detailRng() < 0.5 ? g.from + detailRng() * 0.2 * span : g.to - detailRng() * 0.2 * span;
+        const i = Math.min(path.length - 1, Math.round(d / 1.02));
+        const [px, pz] = path[i];
+        wallRubble.push({ x: px + (detailRng() - 0.5) * 0.8, z: pz + (detailRng() - 0.5) * 0.8, s: 0.25 + detailRng() * 0.25 });
+      }
+    }
+  }
+  // exact count (SS4: 550 wall blocks): trim surplus course blocks; every
+  // path end — natural, stepped-out, or trimmed — finishes as a collapse
+  // (DS1) via rock-mesh rubble, never a clean cut (rB9-gpt probe B).
+  while (transforms.length > 550) transforms.pop();
+  if (transforms.length < 550) {
+    for (const col of wallColumns) {
+      if (transforms.length >= 550) break;
+      if (col.courses === 2) {
+        const b = { x: col.x, y: col.found + 1.10, z: col.z, yaw: col.yaw, s: 0.95, sy: 0.889, rubble: false };
+        col.blocks.push(b); transforms.push(b); col.courses = 3;
+      }
+    }
+  }
+  for (const run of wallRunsExport) {
+    const [ex, ez] = run.points[run.points.length - 1];
+    for (let k = 0; k < 4; k++) wallRubble.push({ x: ex + (detailRng() - 0.5) * 1.6, z: ez + (detailRng() - 0.5) * 1.6, s: 0.25 + detailRng() * 0.25 });
+  }
+  const walls = new THREE.InstancedMesh(blockGeo, stoneMat, transforms.length);
+  window.__MOORS_WALLBLOCKS__ = transforms.length;
+  const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler();
+  transforms.forEach((t, i) => {
+    e.set(t.rubble ? 0.4 : 0, t.yaw, t.rubble ? 0.3 : 0); q.setFromEuler(e);
+    m4.compose(new THREE.Vector3(t.x, t.y, t.z), q, new THREE.Vector3(t.s, t.sy !== undefined ? t.sy : (t.rubble ? 0.6 : 1), t.s));
+    walls.setMatrixAt(i, m4);
+  });
+  walls.instanceMatrix.needsUpdate = true;
+  scene.add(walls);
+  placements.push({ kind: 'wall-blocks', x: 0, z: 0, why: 'ss4-count-550', count: transforms.length });
+}
+window.__MOORS_WALLRUNS__ = wallRunsExport;
+// D1/D6 shared geometry: distance from a point to the nearest wall-path
+// segment (full polylines — gaps are path too; the path is the path).
+function wallPathDist(x, z) {
+  let best = Infinity;
+  for (const p of wallRunsExport) {
+    const pts = p.points;
+    for (let i = 0; i + 1 < pts.length; i++) {
+      const ax = pts[i][0], az = pts[i][1], bx = pts[i + 1][0], bz = pts[i + 1][1];
+      const abx = bx - ax, abz = bz - az;
+      const t = Math.max(0, Math.min(1, ((x - ax) * abx + (z - az) * abz) / (abx * abx + abz * abz || 1)));
+      const d = Math.hypot(x - (ax + abx * t), z - (az + abz * t));
+      if (d < best) best = d;
+    }
+  }
+  return best;
+}
+window.__MOORS_WALLPATHDIST__ = wallPathDist;
+
+// ---- C19: exactly 10 gnarled trees (SS4) ----
+function treeGeometry(seed) {
+  const rng = mulberry32(seed);
+  const parts = [];
+  function branch(pos, dir, len, rad, depth) {
+    const end = pos.clone().addScaledVector(dir, len);
+    const geo = new THREE.CylinderGeometry(rad * 0.62, rad, len, 5, 1);
+    geo.translate(0, len / 2, 0);
+    const quat = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.clone().normalize());
+    geo.applyQuaternion(quat);
+    geo.translate(pos.x, pos.y, pos.z);
+    parts.push(geo);
+    if (depth <= 0) return;
+    const kids = depth === 3 ? 3 : 2;
+    for (let k = 0; k < kids; k++) {
+      const nd = dir.clone();
+      nd.x += (rng() - 0.5) * 1.15; nd.z += (rng() - 0.5) * 1.15; nd.y += 0.25 + rng() * 0.3;
+      nd.normalize();
+      branch(end, nd, len * (0.62 + rng() * 0.14), rad * 0.58, depth - 1);
+    }
+  }
+  branch(new THREE.Vector3(0, -0.3, 0), new THREE.Vector3(0.14, 1, 0.08).normalize(), 1.9, 0.30, 3);
+  return mergeGeometries(parts);
+}
+{
+  const spots = [];
+  for (let tries = 0; tries < 6000 && spots.length < 10; tries++) {
+    const x = (detailRng() * 2 - 1) * 230, z = (detailRng() * 2 - 1) * 230;
+    const field = fbm(x * 0.02 + 55.1, z * 0.02 + 23.4, WORLD.seed + 9);
+    if (field < 0.56 || slopeAt(x, z) > 0.5) continue;
+    if (nearLandmark(x, z, 24)) continue;                       // circle exclusion
+    if (x * x + z * z < 30 * 30) continue;                      // spawn clearing
+    if (spots.some(s => (s.x - x) ** 2 + (s.z - z) ** 2 < 25 * 25)) continue;
+    if (wallPathDist(x, z) < 8) continue; // D3: trees stand at least 8 m from a wall path (rB25 fuzz find)
+    spots.push({ x, z });
+  }
+  const perArch = [[], [], []];
+  spots.forEach((s, i) => perArch[i % 3].push(s));
+  const up = new THREE.Vector3(0, 1, 0), zAxis = new THREE.Vector3(0, 0, 1);
+  perArch.forEach((list, ai) => {
+    if (!list.length) return;
+    const inst = new THREE.InstancedMesh(treeGeometry(itemSeed(2, 100 + ai)), barkMat, list.length); // DL2 derived archetype seed
+    const m4 = new THREE.Matrix4();
+    list.forEach((s, i) => {
+      const trng = itemRng(2, ai + i * 3); // DL2: global tree index (round-robin archetypes)
+      const q = new THREE.Quaternion().setFromAxisAngle(up, trng() * Math.PI * 2);
+      const bend = (4 + trng() * 4) * Math.PI / 180;       // wind-bent eastward 4-8 deg (SS4)
+      q.multiply(new THREE.Quaternion().setFromAxisAngle(zAxis, -bend));
+      const sc = 0.8 + trng() * 0.7;
+      m4.compose(new THREE.Vector3(s.x, groundHeight(s.x, s.z) - 0.25, s.z), q, new THREE.Vector3(sc, sc * (0.9 + trng() * 0.3), sc));
+      inst.setMatrixAt(i, m4);
+      colliders.push({ kind: 'tree', x: s.x, z: s.z, r: 0.35 * sc });
+      placements.push({ kind: 'tree', x: +s.x.toFixed(1), z: +s.z.toFixed(1), why: 'ss4-count-10' });
+      contactRing(s.x, s.z, 1.2);
+    });
+    inst.instanceMatrix.needsUpdate = true;
+    scene.add(inst);
+  });
+}
+
+// ---- C22: 280 rocks (SS4) ----
+{
+  const rockGeo = new THREE.IcosahedronGeometry(1, 0);
+  const rp = rockGeo.attributes.position;
+  const rj = mulberry32(WORLD.seed ^ 0x90cc5);
+  for (let vi = 0; vi < rp.count; vi++) {
+    const s = 0.78 + rj() * 0.45;
+    rp.setXYZ(vi, rp.getX(vi) * s, rp.getY(vi) * s * 0.72, rp.getZ(vi) * s);
+  }
+  rockGeo.computeVertexNormals();
+  const rocks = new THREE.InstancedMesh(rockGeo, stoneMat, 280 + wallRubble.length);
+  const m4 = new THREE.Matrix4(), e = new THREE.Euler();
+  const rockColliders = [];
+  let placedRocks = 0, guard = 0;
+  const rockSpots = [];
+  // D5 (R12): exact size classes — 224 small (<0.9m, no colliders), 40 large
+  // (>=1.05m, colliders), 16 medium (0.90-1.04m, DL5 corridor class).
+  const rockClasses = [];
+  for (let i = 0; i < 224; i++) rockClasses.push('S');
+  for (let i = 0; i < 40; i++) rockClasses.push('C');
+  for (let i = 0; i < 16; i++) rockClasses.push('M');
+  for (let i = rockClasses.length - 1; i > 0; i--) { const j = Math.floor(detailRng() * (i + 1)); const t = rockClasses[i]; rockClasses[i] = rockClasses[j]; rockClasses[j] = t; }
+  while (placedRocks < 280 && guard++ < 280 * 30) {
+    const x = (detailRng() * 2 - 1) * 235, z = (detailRng() * 2 - 1) * 235;
+    if (slopeAt(x, z) > 0.9 || nearLandmark(x, z, 19)) continue;
+    if (rockSpots.some(s => (s.x - x) ** 2 + (s.z - z) ** 2 < 9)) continue;
+    const cls = rockClasses[placedRocks];
+    const rrng = itemRng(3, placedRocks); // DL2: per-rock variation stream
+    const r = cls === 'S' ? 0.3 + rrng() * 0.59 : cls === 'C' ? 1.05 + rrng() * 0.55 : 0.9 + rrng() * 0.14;
+    if (cls === 'M') { // DL5: medium rocks stay out of the corridor
+      const abx = 45, abz = -105;
+      const tt = Math.max(0, Math.min(1, (x * abx + z * abz) / (abx * abx + abz * abz)));
+      const ddx = x - abx * tt, ddz = z - abz * tt;
+      if (ddx * ddx + ddz * ddz < (3 + r) * (3 + r)) continue;
+    }
+    rockSpots.push({ x, z, r, cls });
+    e.set(rrng() * 0.6, rrng() * Math.PI * 2, rrng() * 0.6);
+    const q = new THREE.Quaternion().setFromEuler(e);
+    m4.compose(new THREE.Vector3(x, groundHeight(x, z) - 0.4 * r, z), q, new THREE.Vector3(r, r, r));
+    rocks.setMatrixAt(placedRocks, m4);
+    if (cls === 'C') rockColliders.push({ kind: 'rock', x, z, r: r * 0.85 });
+    placements.push({ kind: 'rock', x: +x.toFixed(1), z: +z.toFixed(1), why: 'ss4-count-280', r: +r.toFixed(2), cls });
+    placedRocks++;
+  }
+  // SS4: wall rubble rides the rock mesh at small scales.
+  for (const rb of wallRubble) {
+    e.set(detailRng() * 0.9, detailRng() * Math.PI * 2, detailRng() * 0.9);
+    const q = new THREE.Quaternion().setFromEuler(e);
+    m4.compose(new THREE.Vector3(rb.x, groundHeight(rb.x, rb.z) + 0.04, rb.z), q, new THREE.Vector3(rb.s, rb.s, rb.s));
+    rocks.setMatrixAt(placedRocks++, m4);
+  }
+  placements.push({ kind: 'wall-rubble', x: 0, z: 0, why: 'ss4-rock-mesh', count: wallRubble.length });
+  { // DL5 audit: medium rocks inside the 6m approach corridor (0 required)
+    let inCorr = 0;
+    for (const s of rockSpots) {
+      if (s.cls !== 'M') continue;
+      const abx = 45, abz = -105;
+      const tt = Math.max(0, Math.min(1, (s.x * abx + s.z * abz) / (abx * abx + abz * abz)));
+      const ddx = s.x - abx * tt, ddz = s.z - abz * tt;
+      if (ddx * ddx + ddz * ddz < (3 + s.r) * (3 + s.r)) inCorr++;
+    }
+    placements.push({ kind: 'audit', x: 0, z: 0, why: 'dl5-corridor', rockInCorridor: inCorr });
+  }
+  rocks.count = placedRocks;
+  rocks.instanceMatrix.needsUpdate = true;
+  scene.add(rocks);
+  rockColliders.sort((a, b) => b.r - a.r);
+  colliders.push(...rockColliders.slice(0, 40)); // M13: at most 40 boulder circles
+}
+
+bakeContactDarkening(); // DL4: stones + walls + trees now placed
+
+// ---- C20: 3,800 tufts — 3 crossed bent blades, 12 tris each (SS4) ----
+{
+  function bladeGeo() {
+    const parts = [];
+    for (let o = 0; o < 3; o++) {
+      const lower = new THREE.PlaneGeometry(0.36, 0.28);
+      lower.translate(0, 0.14, 0);
+      const upper = new THREE.PlaneGeometry(0.30, 0.26);
+      upper.translate(0, 0.13, 0);
+      upper.rotateX(-0.55);
+      upper.translate(0, 0.26, 0.02);
+      for (const g of [lower, upper]) {
+        const cnt = g.attributes.position.count;
+        const cols = new Float32Array(cnt * 3);
+        const base = new THREE.Color(0x2e241d), tip = new THREE.Color(0x4a5638), c = new THREE.Color();
+        for (let vi = 0; vi < cnt; vi++) {
+          const t = THREE.MathUtils.clamp((g.attributes.position.getY(vi) + 0.15) / 0.6, 0, 1);
+          c.copy(base).lerp(tip, t);
+          cols[vi * 3] = c.r; cols[vi * 3 + 1] = c.g; cols[vi * 3 + 2] = c.b;
+        }
+        g.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+        g.rotateY(o * Math.PI / 3 + 0.3);
+        parts.push(g);
+      }
+    }
+    return mergeGeometries(parts);
+  }
+  const COUNT = 3800;
+  const tufts = new THREE.InstancedMesh(bladeGeo(), tuftMat, COUNT);
+  window.__MOORS_TUFTCOUNT__ = COUNT;
+  window.__MOORS_TUFTS__ = tufts;
+  const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), up = new THREE.Vector3(0, 1, 0);
+  const tint = new THREE.Color();
+  const palette = [new THREE.Color(0xffffff), new THREE.Color(0xb9a7c4), new THREE.Color(0x9aa48a)];
+  // DL1: instances are emitted in keep-priority order (D1 desirability =
+  // the patch field, highest first), so a tier's active set is exactly
+  // the first N instances and a tier drop sheds the least valuable tufts.
+  const tuftEntries = [];
+  let guard = 0;
+  while (tuftEntries.length < COUNT && guard++ < COUNT * 14) {
+    const x = (detailRng() * 2 - 1) * 240, z = (detailRng() * 2 - 1) * 240;
+    const patch = fbm(x * 0.06 + 91.2, z * 0.06 + 47.8, WORLD.seed + 5);
+    if (patch < 0.52 || slopeAt(x, z) > 0.7002 || nearLandmark(x, z, 19) || wallPathDist(x, z) < 0.6) continue; // D1: slope > 35 deg, circle, 0.6 m wall clearance
+    const trng = itemRng(4, tuftEntries.length); // DL2: per-tuft variation stream
+    const yawA = trng() * Math.PI * 2;
+    const sc = 0.7 + trng() * 0.6;
+    const sy = sc * (0.8 + trng() * 0.5);
+    const tintC = palette[Math.floor(trng() * 3)];
+    tuftEntries.push({ x, z, patch, yawA, sc, sy, tintC });
+  }
+  window.__MOORS_TUFTPTS__ = tuftEntries.map(e => [e.x, e.z]); // D6 audit input
+  tuftEntries.sort((a, b) => b.patch - a.patch);
+  tuftEntries.forEach((t, i) => {
+    q.setFromAxisAngle(up, t.yawA);
+    m4.compose(new THREE.Vector3(t.x, groundHeight(t.x, t.z) - 0.02, t.z), q, new THREE.Vector3(t.sc, t.sy, t.sc));
+    tufts.setMatrixAt(i, m4);
+    tufts.setColorAt(i, tint.copy(t.tintC));
+  });
+  const placedCount = tuftEntries.length;
+  tufts.count = placedCount;
+  tufts.instanceMatrix.needsUpdate = true;
+  if (tufts.instanceColor) tufts.instanceColor.needsUpdate = true;
+  scene.add(tufts);
+  placements.push({ kind: 'tufts', x: 0, z: 0, why: 'ss4-count-3800', count: placedCount });
+}
+window.__MOORS_PLACEMENTS__ = placements;
+window.__MOORS_COLLIDERS__ = colliders;
+
+let locked = false;
+// ---- Audio (BUILD round 11 — SS6 conformance) ---------------------------------
+// All sound is synthesized at runtime (Web Audio API); nothing external.
+// The graph, recipes, scheduler, and lifecycle follow SS6 + AU1-AU7:
+// no footstep/body/UI sounds (AU1 — the five event types are the complete
+// vocabulary); listener from the camera every frame, world up (AU2);
+// event panners omnidirectional with cones set explicitly (AU3); buffers
+// built sample-rate honestly (AU4); each voice's gain cap sits BEFORE its
+// panner (AU5); the wind ensemble starts phase-locked (AU6); concurrency
+// is scheduler-governed, never voice-stolen (AU7).
+let audioCtx = null, audioStarted = false, audioMaster = null;
+let activeVoices = 0;
+window.__moors.activeAudioNodes = 0;
+const audioRng = mulberry32(WORLD.seed ^ 0xa0d10);
+
+const windRng = mulberry32(WORLD.seed ^ 0x57494e44); // S8 stream (seed XOR 0x57494E44)
+function makeWindBuffer(ctx) {
+  // 4.0s of pink/brown-weighted noise, tail crossfaded into the head so
+  // the loop is seamless. Frame counts derive from the real sample rate.
+  const sr = ctx.sampleRate, len = Math.round(4.0 * sr);
+  const buf = ctx.createBuffer(1, len, sr), d = buf.getChannelData(0);
+  let b0 = 0, b1 = 0, brown = 0;
+  for (let i = 0; i < len; i++) {
+    const w = windRng() * 2 - 1; // S8: dedicated wind stream, never the scheduler stream
+    b0 = 0.997 * b0 + 0.029 * w; b1 = 0.985 * b1 + 0.032 * w; // pinkish shelves
+    brown = (brown + 0.02 * w) / 1.02;                        // brown rumble
+    d[i] = (b0 * 1.4 + b1 * 0.8 + brown * 1.1) * 0.6;
+  }
+  const fade = Math.round(0.5 * sr);
+  for (let i = 0; i < fade; i++) {
+    const t = i / fade;
+    d[i] = d[i] * t + d[len - fade + i] * (1 - t);
+  }
+  return buf;
+}
+const noiseRng = mulberry32(WORLD.seed ^ 0x4e4f4953); // persistent content stream (rB14-gpt)
+function makeNoiseBuffer(ctx, seconds) {
+  // Content noise has its own stream (S3 discipline): the scheduler
+  // stream carries type/azimuth/radius/interval draws only, so event
+  // content can never perturb the S7 deterministic event sequence.
+  const sr = ctx.sampleRate, len = Math.round(seconds * sr);
+  const buf = ctx.createBuffer(1, len, sr), d = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) d[i] = noiseRng() * 2 - 1;
+  return buf;
+}
+
+// Each builder wires its voice into `out` (the pre-panner gain cap, AU5),
+// starts at ctx time `t`, and returns the source whose onended the caller
+// uses for cleanup (SS6 lifecycle).
+const EVENT_BUILDERS = [
+  function curlew(ctx, out, t) { // swept cry, 1.6s
+    const osc = ctx.createOscillator(); osc.type = 'triangle';
+    osc.frequency.setValueAtTime(1450, t);
+    osc.frequency.exponentialRampToValueAtTime(920, t + 0.7);
+    osc.frequency.exponentialRampToValueAtTime(1180, t + 1.4);
+    const vib = ctx.createOscillator(); vib.frequency.value = 6.5;
+    const vibGain = ctx.createGain(); vibGain.gain.value = 25;
+    vib.connect(vibGain); vibGain.connect(osc.frequency);
+    const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 1200; bp.Q.value = 4;
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(0, t);
+    env.gain.linearRampToValueAtTime(0.5, t + 0.15);
+    env.gain.setValueAtTime(0.5, t + 1.1);
+    env.gain.linearRampToValueAtTime(0, t + 1.6);
+    osc.connect(bp); bp.connect(env); env.connect(out);
+    osc.start(t); osc.stop(t + 1.65); vib.start(t); vib.stop(t + 1.65);
+    return osc;
+  },
+  function drone(ctx, out, t) { // detuned sub pair, 4.5s swell
+    const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 180;
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(0, t);
+    env.gain.linearRampToValueAtTime(0.55, t + 1.8);
+    env.gain.setValueAtTime(0.55, t + 3.2);
+    env.gain.linearRampToValueAtTime(0, t + 4.5);
+    lp.connect(env); env.connect(out);
+    let last = null;
+    for (const f of [55, 56.8]) {
+      const o = ctx.createOscillator(); o.type = 'sine'; o.frequency.value = f;
+      o.connect(lp); o.start(t); o.stop(t + 4.55); last = o;
+    }
+    return last;
+  },
+  function creak(ctx, out, t) { // stick-slip bursts + FM resonant band, 1.2s
+    const src = ctx.createBufferSource(); src.buffer = makeNoiseBuffer(ctx, 1.3);
+    const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 430; bp.Q.value = 14;
+    const fm = ctx.createOscillator(); fm.frequency.value = 0.7;
+    const fmGain = ctx.createGain(); fmGain.gain.value = 110; // 320-540 Hz sweep
+    fm.connect(fmGain); fmGain.connect(bp.frequency);
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(0, t);
+    let tt = t;
+    while (tt < t + 1.05) { // stick-slip: short bursts, irregular spacing
+      const burst = 0.03 + audioRng() * 0.07;
+      env.gain.linearRampToValueAtTime(0.34, tt + burst * 0.4);
+      env.gain.linearRampToValueAtTime(0.02, tt + burst);
+      tt += burst + 0.02 + audioRng() * 0.09;
+    }
+    env.gain.linearRampToValueAtTime(0, t + 1.2);
+    src.connect(bp); bp.connect(env); env.connect(out);
+    src.start(t); src.stop(t + 1.25); fm.start(t); fm.stop(t + 1.25);
+    return src;
+  },
+  function bell(ctx, out, t) { // additive partials, 3.8s decay
+    const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 900;
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(0.5, t);
+    env.gain.exponentialRampToValueAtTime(0.001, t + 3.8);
+    lp.connect(env); env.connect(out);
+    let last = null;
+    const partials = [[220, 0.5], [261, 0.35], [394, 0.22], [537, 0.12]];
+    for (const [f, g] of partials) {
+      const o = ctx.createOscillator(); o.type = 'sine'; o.frequency.value = f;
+      const og = ctx.createGain(); og.gain.value = g;
+      o.connect(og); og.connect(lp); o.start(t); o.stop(t + 3.85); last = o;
+    }
+    return last;
+  },
+  function call(ctx, out, t) { // two-syllable formant call, 1.1s
+    const saw = ctx.createOscillator(); saw.type = 'sawtooth';
+    saw.frequency.setValueAtTime(480, t);
+    saw.frequency.linearRampToValueAtTime(390, t + 0.35);
+    saw.frequency.setValueAtTime(430, t + 0.65);
+    saw.frequency.linearRampToValueAtTime(340, t + 1.0);
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(0, t);
+    env.gain.linearRampToValueAtTime(0.4, t + 0.05);
+    env.gain.setValueAtTime(0.4, t + 0.35);
+    env.gain.linearRampToValueAtTime(0, t + 0.42);
+    env.gain.setValueAtTime(0, t + 0.65);
+    env.gain.linearRampToValueAtTime(0.38, t + 0.7);
+    env.gain.setValueAtTime(0.38, t + 1.0);
+    env.gain.linearRampToValueAtTime(0, t + 1.1);
+    for (const f of [700, 1150]) { // formant pair
+      const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = f; bp.Q.value = 6;
+      saw.connect(bp); bp.connect(env);
+    }
+    env.connect(out);
+    saw.start(t); saw.stop(t + 1.15);
+    return saw;
+  },
+];
+const EVENT_NAMES = ['curlew', 'drone', 'creak', 'bell', 'call'];
+
+function fireEvent(type, when) {
+  const ctx = audioCtx;
+  const ang = audioRng() * Math.PI * 2, rad = 20 + audioRng() * 40;
+  const ex = player.x + Math.cos(ang) * rad, ez = player.z + Math.sin(ang) * rad;
+  const cap = ctx.createGain(); cap.gain.value = 0.9; // AU5: cap before the panner
+  const panner = ctx.createPanner();
+  panner.panningModel = 'HRTF';
+  panner.distanceModel = 'inverse';
+  panner.refDistance = 12; panner.rolloffFactor = 1.2; panner.maxDistance = 120;
+  panner.coneInnerAngle = 360; panner.coneOuterAngle = 360; panner.coneOuterGain = 0; // AU3, explicit
+  if (panner.positionX) {
+    panner.positionX.value = ex; panner.positionY.value = groundHeight(ex, ez) + 1.5; panner.positionZ.value = ez;
+  } else panner.setPosition(ex, groundHeight(ex, ez) + 1.5, ez);
+  cap.connect(panner); panner.connect(audioMaster);
+  const last = EVENT_BUILDERS[type](ctx, cap, when);
+  activeVoices++;
+  window.__moors.activeAudioNodes = activeVoices;
+  window.__moors.eventLog.push({ type: EVENT_NAMES[type], time: +when.toFixed(2), distance: +rad.toFixed(1), azimuth: +ang.toFixed(2) }); // SS8
+  last.onended = () => {
+    try { cap.disconnect(); panner.disconnect(); } catch (e) { /* already gone */ }
+    activeVoices--;
+    window.__moors.activeAudioNodes = activeVoices;
+  };
+}
+
+function startAudio() {
+  // SS6: the AudioContext is created/resumed strictly inside the click
+  // handler that grabs pointer lock. Idempotent; lock loss never stops it.
+  if (audioStarted) return;
+  let ctx;
+  try {
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (ctx.state === 'suspended') ctx.resume();
+  } catch (err) {
+    // S5: audio-init failure is a typed warning with silent continuation;
+    // the game runs without audio and a later click may retry.
+    window.__moors.errors.push({ type: 'warning', message: 'audio unavailable: ' + String((err && err.message) || err), stack: String((err && err.stack) || ''), time: performance.now() / 1000 });
+    return;
+  }
+  audioStarted = true;
+  audioCtx = ctx;
+  const comp = ctx.createDynamicsCompressor();
+  comp.connect(ctx.destination);
+  audioMaster = ctx.createGain(); audioMaster.gain.value = 1;
+  audioMaster.connect(comp);
+
+  // Wind bed: one buffer source through two parallel filtered paths.
+  const t0 = ctx.currentTime + 0.05;
+  const src = ctx.createBufferSource();
+  src.buffer = makeWindBuffer(ctx); src.loop = true;
+  const windGain = ctx.createGain(); windGain.gain.value = 0.22; // ~0.22 peak
+  windGain.connect(audioMaster);
+  const lowFilter = ctx.createBiquadFilter(); lowFilter.type = 'lowpass'; lowFilter.frequency.value = 140; lowFilter.Q.value = 1.2;
+  const lowGain = ctx.createGain(); lowGain.gain.value = 0.55;
+  src.connect(lowFilter); lowFilter.connect(lowGain); lowGain.connect(windGain);
+  const highFilter = ctx.createBiquadFilter(); highFilter.type = 'bandpass'; highFilter.frequency.value = 680; highFilter.Q.value = 3.8;
+  const highGain = ctx.createGain(); highGain.gain.value = 0.3;
+  src.connect(highFilter); highFilter.connect(highGain); highGain.connect(windGain);
+  // LFO ensemble — all started at t0 (AU6 phase lock).
+  const lfoLow = ctx.createOscillator(); lfoLow.frequency.value = 0.047;
+  const lfoLowCut = ctx.createGain(); lfoLowCut.gain.value = 45;
+  lfoLow.connect(lfoLowCut); lfoLowCut.connect(lowFilter.frequency);
+  const lfoLowG = ctx.createGain(); lfoLowG.gain.value = 0.04;
+  lfoLow.connect(lfoLowG); lfoLowG.connect(lowGain.gain);
+  const lfoHigh = ctx.createOscillator(); lfoHigh.frequency.value = 0.083;
+  const lfoHighCut = ctx.createGain(); lfoHighCut.gain.value = 240;
+  lfoHigh.connect(lfoHighCut); lfoHighCut.connect(highFilter.frequency);
+  const lfoHighG = ctx.createGain(); lfoHighG.gain.value = 0.025;
+  lfoHigh.connect(lfoHighG); lfoHighG.connect(highGain.gain);
+  src.start(t0); lfoLow.start(t0); lfoHigh.start(t0);
+
+  // Scheduler: 250ms lookahead tick on AudioContext time; shuffle bag over
+  // the five types (Fisher-Yates, no back-to-back repeats); intervals
+  // 8-20s; max 2 concurrent, scheduler-governed (AU7 — no voice stealing).
+  let bag = [];
+  const refill = () => {
+    bag = [0, 1, 2, 3, 4];
+    for (let i = bag.length - 1; i > 0; i--) {
+      const j = Math.floor(audioRng() * (i + 1));
+      [bag[i], bag[j]] = [bag[j], bag[i]];
+    }
+    if (bag[0] === lastType) [bag[0], bag[1]] = [bag[1], bag[0]];
+  };
+  let lastType = -1;
+  refill();
+  let nextWhen = ctx.currentTime + 8 + audioRng() * 12;
+  setInterval(() => {
+    if (!audioCtx) return;
+    while (nextWhen < ctx.currentTime + 0.3) {
+      if (activeVoices >= 2) { nextWhen = ctx.currentTime + 1; break; }
+      const type = bag.shift();
+      if (!bag.length) refill();
+      lastType = type;
+      fireEvent(type, nextWhen);
+      nextWhen += 8 + audioRng() * 12;
+    }
+  }, 250);
+}
+
+function syncAudioListener() {
+  // AU2: position + forward from the camera every frame; up stays (0,1,0).
+  if (!audioCtx) return;
+  const l = audioCtx.listener, p = camera.position;
+  const dir = new THREE.Vector3();
+  camera.getWorldDirection(dir);
+  if (l.positionX) {
+    l.positionX.value = p.x; l.positionY.value = p.y; l.positionZ.value = p.z;
+    l.forwardX.value = dir.x; l.forwardY.value = dir.y; l.forwardZ.value = dir.z;
+    l.upX.value = 0; l.upY.value = 1; l.upZ.value = 0;
+  } else if (l.setPosition) {
+    l.setPosition(p.x, p.y, p.z);
+    l.setOrientation(dir.x, dir.y, dir.z, 0, 1, 0);
+  }
+}
+// Session plumbing (C30 / SS1 / A5 / M5 / M16): error capture with banner,
+// pointer-lock lifecycle with key clearing + paused state, and the
+// drag-look fallback when pointer lock is unavailable.
+let dragLook = false, dragDown = false, hintFaded = false;
+function showBanner() {
+  const b = document.getElementById('banner');
+  if (b) { b.textContent = window.__moors.errors.length + ' error(s) captured — see window.__moors.errors'; b.classList.add('show'); }
+}
+window.addEventListener('error', (e) => { window.__moors.errors.push({ type: 'error', message: String((e && e.message) || 'unknown'), stack: String((e && e.error && e.error.stack) || ''), time: performance.now() / 1000 }); showBanner(); });
+window.addEventListener('unhandledrejection', (e) => { window.__moors.errors.push({ type: 'rejection', message: String((e && e.reason) || 'unknown'), stack: String((e && e.reason && e.reason.stack) || ''), time: performance.now() / 1000 }); showBanner(); });
+document.addEventListener('pointerlockerror', () => {
+  if (!dragLook) {
+    dragLook = true;
+    window.__moors.errors.push({ type: 'pointerlock-fallback', message: 'pointer lock unavailable; drag-look fallback active (A5)' });
+  }
+});
+renderer.domElement.addEventListener('mousedown', () => { if (dragLook) dragDown = true; });
+window.addEventListener('mouseup', () => { dragDown = false; });
+overlay.addEventListener('click', () => {
+  if (!audioStarted) startAudio();
+  if (TEST_MODE) { startAudio(); overlay.classList.add('hidden'); return; } // SS8 ?test=1: bypass pointer lock
+  if (dragLook) { overlay.classList.add('hidden'); return; } // A5 drag fallback: resume clears the pause explicitly, no pointer lock involved
+  renderer.domElement.requestPointerLock();
+});
+function pauseSession() { // M5/M16: keys clear, look deltas drop, overlay returns (audio keeps running)
+  keysDown.clear(); lookDX = 0; lookDY = 0;
+  if (!locked) {
+    overlay.classList.remove('hidden');
+    const s = document.getElementById('overlaySub');
+    if (s && audioStarted) s.textContent = 'Paused — click to resume';
+  }
+}
+document.addEventListener('pointerlockchange', () => {
+  locked = document.pointerLockElement === renderer.domElement;
+  overlay.classList.toggle('hidden', locked);
+  if (!locked) pauseSession();
+});
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+
+// ---- Movement (BUILD round 10 — SS5/M-series conformance) ---------------------
+// The M8 pipeline, in order, every frame: (1) read input (look deltas were
+// accumulated per-event with the M15 clamp and are applied here, MC1)
+// (2) intended displacement from the exponentially damped velocity (SS5)
+// (3) dt already clamped to 0.05 by the caller (M9) (4) integrate
+// (5) SS5 boundary leash (M14) (6) slope admissibility (MI2/BS1/BS2)
+// (7) collider resolution, M12 (8) camera height = groundHeight + 1.70
+// exactly (MI1) (9) diagnostics.
+// Slope has ONE definition (TR4): central differences on the 2.5m grid,
+// as an angle. The admissibility limit is pinned at 35 degrees — the plan's
+// only pinned terrain-slope threshold (D1) — recorded as a plan-gap pin in
+// the conformance register (R10). M2 holds: no slope physics, no sliding,
+// no speed modifier — slope only admits or blocks, with the BS2 fade.
+const WALK_SPEED = 4.2, SPRINT_SPEED = 6.0, PLAYER_R = 0.45;
+const SLOPE_LIMIT_DEG = 35, SLOPE_FADE_DEG = 8.75; // fade band = 25% of limit (BS2)
+// gridSlope(x, z) is defined with the terrain (TR4) and shared by detail
+// placement, this movement code, and the audits.
+
+// ---- Collider inventory (M13): stable ids in placement order --------------
+// Circles: standing stones 11, tree trunks 10, large rocks <=40. Capsules:
+// wall intact runs only (DS1/SS5), halfWidth 0.45m, chunked <=7m. Total
+// <= 99: N_wall <= 99 - 21 - N_boulder (boulders yield first).
+const COLLIDERS = [];
+{
+  const circles = colliders.filter(c => c.kind === 'standing-stone' || c.kind === 'tree' || c.kind === 'rock');
+  const capsules = [];
+  for (const run of (window.__MOORS_WALLRUNS__ || [])) {
+    for (const seg of run.runs) {
+      let start = seg.a, acc = 0;
+      for (let i = seg.a + 1; i <= seg.b; i++) {
+        const [ax, az] = run.points[i - 1], [bx, bz] = run.points[i];
+        acc += Math.hypot(bx - ax, bz - az);
+        if (acc >= 7 || i === seg.b) {
+          capsules.push({ kind: 'wall', ax: run.points[start][0], az: run.points[start][1], bx, bz, hw: 0.45 });
+          start = i; acc = 0;
+        }
+      }
+    }
+  }
+  let boulders = circles.filter(c => c.kind === 'rock');
+  const fixed = circles.filter(c => c.kind !== 'rock');
+  window.__MOORS_WORLD__.wallColliderExcess = Math.max(0, capsules.length - 38); // M13 audit (0 required)
+const maxBoulders = Math.max(0, 99 - fixed.length - capsules.length);
+  if (boulders.length > maxBoulders) boulders = boulders.slice(0, maxBoulders); // smallest yield (sorted desc in detail)
+  for (const c of [...fixed, ...boulders]) COLLIDERS.push({ id: COLLIDERS.length, kind: c.kind, x: c.x, z: c.z, r: c.r });
+  for (const c of capsules) COLLIDERS.push({ id: COLLIDERS.length, ...c });
+}
+window.__MOORS_COLLIDERS2__ = COLLIDERS;
+
+function penetration(px, pz, c) {
+  // Signed penetration depth of the player circle into collider c (>0 = inside).
+  if (c.kind === 'wall') {
+    const abx = c.bx - c.ax, abz = c.bz - c.az;
+    const t = Math.max(0, Math.min(1, ((px - c.ax) * abx + (pz - c.az) * abz) / (abx * abx + abz * abz || 1)));
+    const qx = c.ax + abx * t, qz = c.az + abz * t;
+    const d = Math.hypot(px - qx, pz - qz);
+    return { depth: (c.hw + PLAYER_R) - d, nx: d > 1e-9 ? (px - qx) / d : 1, nz: d > 1e-9 ? (pz - qz) / d : 0 };
+  }
+  const d = Math.hypot(px - c.x, pz - c.z);
+  return { depth: (c.r + PLAYER_R) - d, nx: d > 1e-9 ? (px - c.x) / d : 1, nz: d > 1e-9 ? (pz - c.z) / d : 0 };
+}
+function resolveCollisions(px, pz) {
+  // M12: deepest-first, ties by stable id, <=3 passes; returns null when
+  // penetration > 1e-4m remains (caller retains the last valid position).
+  for (let pass = 0; pass < 3; pass++) {
+    const hits = [];
+    for (const c of COLLIDERS) {
+      const p = penetration(px, pz, c);
+      if (p.depth > 0) hits.push({ c, ...p });
+    }
+    if (!hits.length) return { x: px, z: pz };
+    hits.sort((a, b) => (b.depth - a.depth) || (a.c.id - b.c.id));
+    for (const h of hits) {
+      px += h.nx * h.depth; pz += h.nz * h.depth;
+    }
+  }
+  for (const c of COLLIDERS) if (penetration(px, pz, c).depth > 1e-4) return null;
+  return { x: px, z: pz };
+}
+
+// ---- Player state ------------------------------------------------------------
+const player = { x: 0, z: 0 };
+const velocity = { x: 0, z: 0 };
+// Spawn faces AWAY from the landmark bearing (+2.4 rad): arrival is never
+// staged toward it (BZ2). Computed from the live landmark so regeneration
+// cannot silently re-aim the spawn.
+let yaw = Math.atan2(-landmarkPos.x, -landmarkPos.z) + 2.4;
+let pitch = 0;
+const keysDown = new Set();
+let lookDX = 0, lookDY = 0; // accumulated per MC1, applied at the frame's input step
+window.addEventListener('keydown', (e) => keysDown.add(e.code));
+window.addEventListener('keyup', (e) => keysDown.delete(e.code));
+window.addEventListener('blur', () => pauseSession()); // M16: blur pauses like lock loss
+document.addEventListener('mousemove', (e) => {
+  if (locked) {
+    // M15: sensitivity first, then the per-event clamp, then accumulate.
+    lookDX += THREE.MathUtils.clamp(e.movementX * 0.002, -0.12, 0.12);
+    lookDY += THREE.MathUtils.clamp(e.movementY * 0.002, -0.12, 0.12);
+  } else if (dragLook && dragDown) {
+    lookDX += THREE.MathUtils.clamp(e.movementX * 0.002, -0.12, 0.12);
+    lookDY += THREE.MathUtils.clamp(e.movementY * 0.002, -0.12, 0.12);
+  }
+});
+camera.rotation.order = 'YXZ';
+
+function stepMovement(dt) {
+  // (1) input step: apply accumulated look once (MC1)
+  yaw -= lookDX; pitch = THREE.MathUtils.clamp(pitch - lookDY, -85 * Math.PI / 180, 85 * Math.PI / 180);
+  lookDX = 0; lookDY = 0;
+  let ix = 0, iz = 0;
+  if (keysDown.has('KeyW') || keysDown.has('ArrowUp')) iz -= 1;
+  if (keysDown.has('KeyS') || keysDown.has('ArrowDown')) iz += 1;
+  if (keysDown.has('KeyA') || keysDown.has('ArrowLeft')) ix -= 1;
+  if (keysDown.has('KeyD') || keysDown.has('ArrowRight')) ix += 1;
+  const hasInput = ix !== 0 || iz !== 0;
+  if (hasInput && !hintFaded) { hintFaded = true; const h = document.getElementById('hint'); if (h) h.classList.add('faded'); }
+  // (2) intended velocity: exponential damping toward the wish velocity (SS5)
+  let wx = 0, wz = 0;
+  if (hasInput) {
+    const len = Math.hypot(ix, iz); ix /= len; iz /= len;
+    const sin = Math.sin(yaw), cos = Math.cos(yaw);
+    const f = -iz, r = ix; // forward is (-sin,-cos); right is (cos,-sin)
+    wx = (r * cos - f * sin); wz = (-r * sin - f * cos);
+    const speed = (keysDown.has('ShiftLeft') || keysDown.has('ShiftRight')) ? SPRINT_SPEED : WALK_SPEED;
+    wx *= speed; wz *= speed;
+  }
+  const k = 1 - Math.exp(-12 * dt);
+  velocity.x += (wx - velocity.x) * k;
+  velocity.z += (wz - velocity.z) * k;
+  // (4) integrate
+  let dx = velocity.x * dt, dz = velocity.z * dt;
+  const stepLen = Math.hypot(dx, dz);
+  if (stepLen > 1e-9) {
+    let nx = player.x + dx, nz = player.z + dz;
+    // (6) slope admissibility (MI2/BS2): fade progress as the candidate's
+    // slope approaches the limit; at/over the limit the step is blocked and
+    // resolved by sliding along the contour (horizontal collision only).
+    const slope = gridSlope(nx, nz);
+    if (slope.angleDeg >= SLOPE_LIMIT_DEG) {
+      const gl = Math.hypot(slope.gx, slope.gz) || 1;
+      const gx = slope.gx / gl, gz = slope.gz / gl;
+      const dot = dx * gx + dz * gz;
+      dx -= gx * dot; dz -= gz * dot; // remove the into-slope component
+      nx = player.x + dx; nz = player.z + dz;
+      if (gridSlope(nx, nz).angleDeg >= SLOPE_LIMIT_DEG) { dx = 0; dz = 0; nx = player.x; nz = player.z; }
+    } else if (slope.angleDeg > SLOPE_LIMIT_DEG - SLOPE_FADE_DEG) {
+      const fade = (SLOPE_LIMIT_DEG - slope.angleDeg) / SLOPE_FADE_DEG;
+      dx *= fade; dz *= fade; nx = player.x + dx; nz = player.z + dz;
+    }
+    // (5) boundary leash (M14): outward radial component scaled by
+    // s(r) = 1 (r<=285), (300-r)/15 (285<r<300), 0 (r>=300).
+    const r0 = Math.hypot(player.x, player.z), r1 = Math.hypot(nx, nz);
+    if (r1 > r0 && r1 > 285) {
+      const s = Math.max(0, (300 - r1) / 15);
+      const ux = player.x / (r0 || 1), uz = player.z / (r0 || 1);
+      const radial = dx * ux + dz * uz;
+      if (radial > 0) {
+        dx -= ux * radial * (1 - s); dz -= uz * radial * (1 - s);
+        nx = player.x + dx; nz = player.z + dz;
+      }
+      const r2 = Math.hypot(nx, nz);
+      if (r2 > 300) { const f = 300 / r2; nx *= f; nz *= f; } // hard backstop
+    }
+    // (7) colliders (M12): on failure retain the last valid position.
+    const resolved = resolveCollisions(nx, nz);
+    if (resolved) { player.x = resolved.x; player.z = resolved.z; }
+    else { velocity.x = 0; velocity.z = 0; }
+  }
+  // (8) exact terrain attachment (MI1) + (9) diagnostics
+  camera.position.set(player.x, groundHeight(player.x, player.z) + EYE, player.z);
+  camera.rotation.y = yaw;
+  camera.rotation.x = pitch;
+  window.__MOORS_PLAYER__ = { x: +player.x.toFixed(2), z: +player.z.toFixed(2), yaw: +yaw.toFixed(3) };
+}
+// M6/M16: the TEST setPose hook runs the same resolution as live movement.
+function setPose(x, z, newYaw, newPitch) {
+  // M16: all inputs must be finite; an invalid pose is rejected whole.
+  if (!Number.isFinite(x) || !Number.isFinite(z) ||
+      (newYaw !== undefined && !Number.isFinite(newYaw)) ||
+      (newPitch !== undefined && !Number.isFinite(newPitch))) {
+    return { x: player.x, z: player.z };
+  }
+  const resolved = resolveCollisions(x, z);
+  if (resolved) {
+    // M14 hard backstop (rB22): setPose runs the same resolution as
+    // live movement, whose final position never exceeds the r300 ring.
+    const rr = Math.hypot(resolved.x, resolved.z);
+    if (rr > 300) { const f = 300 / rr; resolved.x *= f; resolved.z *= f; }
+    player.x = resolved.x; player.z = resolved.z;
+  }
+  velocity.x = 0; velocity.z = 0;
+  if (typeof newYaw === 'number') yaw = newYaw; // SS8: setPose(x, z, yaw, pitch)
+  if (typeof newPitch === 'number') pitch = newPitch;
+  camera.position.set(player.x, groundHeight(player.x, player.z) + EYE, player.z);
+  camera.rotation.y = yaw; camera.rotation.x = pitch;
+  return { x: player.x, z: player.z };
+}
+window.__MOORS_SETPOSE__ = setPose;
+
+// ---- SS8 diagnostics surface (R13 / TT2-C37) ----
+// Completes window.__moors to the frozen SS8 list and adds the ?test=1
+// hooks. Live fields (fps, drawCalls, triangleCount, playerPosition,
+// playerYawPitch, ready, audioStarted, windActive) update per frame via
+// updateDiagnostics(), called from animate().
+const TEST_MODE = /[?&]test=1(&|$)/.test(location.search || '');
+window.__moors.version = GEN_VERSION;
+window.__moors.qualityTier = 'tier0';
+window.__moors.ready = false;
+window.__moors.terrainHeight = terrainHeight;
+window.__moors.groundHeight = groundHeight;
+window.__moors.landmarkCenter = { x: landmarkPos.x, z: landmarkPos.z };
+window.__moors.landmarkCount = 11;
+window.__moors.eventLog = [];
+window.__moors.eventTypes = EVENT_NAMES.slice();
+window.__moors.playerPosition = { x: 0, z: 0 };
+window.__moors.playerYawPitch = { yaw: 0, pitch: 0 };
+window.__moors.audioStarted = false;
+window.__moors.windActive = false;
+window.__moors.fps = 0;
+window.__moors.drawCalls = 0;
+window.__moors.triangleCount = 0;
+window.__moors.detailCounts = {
+  heather: window.__MOORS_TUFTCOUNT__,
+  wallBlocks: window.__MOORS_WALLBLOCKS__,
+  rocks: placements.filter(p => p.kind === 'rock').length,
+  trees: placements.filter(p => p.kind === 'tree').length,
+  standingStones: placements.filter(p => p.kind === 'standing-stone').length,
+  mistPlanes: mistBanks.length
+};
+window.__moors.setPose = setPose;
+window.__moors.triggerEvent = (typeIndex) => {
+  if (!audioCtx || !EVENT_BUILDERS[typeIndex]) return false;
+  // rB13-gpt correction: the TEST hook respects the production two-voice
+  // admission (AU7); a denied trigger is logged, never voiced.
+  if (activeVoices >= 2) {
+    window.__moors.eventLog.push({ type: EVENT_NAMES[typeIndex], time: +audioCtx.currentTime.toFixed(2), distance: 0, azimuth: 0, via: 'trigger', rejected: 'cap' });
+    return false;
+  }
+  fireEvent(typeIndex, audioCtx.currentTime); // TEST hook (T4): excluded from gate (f)'s distinct-types count
+  const entry = window.__moors.eventLog[window.__moors.eventLog.length - 1];
+  if (entry) entry.via = 'trigger';
+  return true;
+};
+window.__moors.placementAudit = () => {
+  let clearance = Infinity;
+  for (const c of COLLIDERS) {
+    if (c.kind === 'wall') { // capsule segment
+      const vx = c.bx - c.ax, vz = c.bz - c.az;
+      const tt = Math.max(0, Math.min(1, ((0 - c.ax) * vx + (0 - c.az) * vz) / (vx * vx + vz * vz || 1)));
+      const dx = c.ax + vx * tt, dz = c.az + vz * tt;
+      clearance = Math.min(clearance, Math.hypot(dx, dz) - c.hw - PLAYER_R);
+    } else {
+      clearance = Math.min(clearance, Math.hypot(c.x, c.z) - c.r - PLAYER_R);
+    }
+  }
+  const dl5 = placements.find(p => p.kind === 'audit');
+  // DL3: entrance gap chord between the flanking stones' footprint points
+  let entranceGapWidth = null;
+  {
+    const cx = landmarkPos.x, cz = landmarkPos.z;
+    const ringStones = COLLIDERS.filter(c => c.kind === 'standing-stone')
+      .map(c => ({ c, d: Math.hypot(c.x - cx, c.z - cz) }))
+      .filter(s => s.d > 14 && s.d < 18)
+      .map(s => ({ ...s.c, ang: Math.atan2(s.c.z - cz, s.c.x - cx) }))
+      .sort((a, b) => a.ang - b.ang);
+    if (ringStones.length >= 2) {
+      const spawnBearing = Math.atan2(-cz, -cx);
+      let best = null;
+      for (let i = 0; i < ringStones.length; i++) {
+        const a = ringStones[i], b = ringStones[(i + 1) % ringStones.length];
+        let span = b.ang - a.ang; if (span <= 0) span += Math.PI * 2;
+        const mid = a.ang + span / 2;
+        let dAng = Math.abs(mid - spawnBearing) % (Math.PI * 2);
+        if (dAng > Math.PI) dAng = Math.PI * 2 - dAng;
+        if (!best || dAng < best.dAng) best = { a, b, dAng };
+      }
+      if (best) entranceGapWidth = +(Math.hypot(best.a.x - best.b.x, best.a.z - best.b.z) - best.a.r - best.b.r).toFixed(2);
+    }
+  }
+  // DO1: rubble sitting in the middle 60% of a gap's passage (0 required)
+  let rubbleInGapPassage = 0;
+  for (const rp of placements.filter(p => p.kind === 'wall-rubble')) {
+    for (const run of (window.__MOORS_WALLRUNS__ || [])) {
+      let nearI = -1, nearD = Infinity;
+      run.points.forEach(([px, pz], i) => { const d = Math.hypot(rp.x - px, rp.z - pz); if (d < nearD) { nearD = d; nearI = i; } });
+      if (nearI < 0 || nearD > 1.0) continue;
+      const dAlong = nearI * 1.02;
+      for (const g of run.gaps) {
+        const span = g.to - g.from;
+        if (dAlong > g.from + 0.2 * span && dAlong < g.to - 0.2 * span) rubbleInGapPassage++;
+      }
+    }
+  }
+  // D6: the twelve violation counts, each independently recalculated
+  // from the stored records — never generation flags.
+  const tuftPts = window.__MOORS_TUFTPTS__ || [];
+  const treeRecs = placements.filter(p => p.kind === 'tree');
+  const rockRecs = placements.filter(p => p.kind === 'rock');
+  const stoneCols = COLLIDERS.filter(c => c.kind === 'standing-stone');
+  const d6 = {
+    tuftInCircle: tuftPts.length === 3800 ? tuftPts.filter(([x, z]) => Math.hypot(x - landmarkPos.x, z - landmarkPos.z) < 17).length : null,
+    tuftOnWall: tuftPts.length === 3800 ? tuftPts.filter(([x, z]) => wallPathDist(x, z) < 0.6).length : null,
+    tuftOverSlope: tuftPts.length === 3800 ? tuftPts.filter(([x, z]) => gridSlope(x, z).angleDeg > 35).length : null,
+    treeTooClose: 0,
+    treeInCircle: treeRecs.filter(t => Math.hypot(t.x - landmarkPos.x, t.z - landmarkPos.z) < 17).length,
+    treeNearWall: treeRecs.filter(t => wallPathDist(t.x, t.z) < 8).length,
+    rockInCircle: rockRecs.filter(r => Math.hypot(r.x - landmarkPos.x, r.z - landmarkPos.z) < 19).length,
+    stoneNotBuried: 0,
+    stoneOverlap: 0,
+    wallStepViolation: 0,
+    mistInClearing: mistBanks.filter(b => Math.hypot(b.position.x, b.position.z) - b.userData.radius < 28).length,
+    rockColliderExcess: Math.max(0, COLLIDERS.filter(c => c.kind === 'rock').length - 40),
+  };
+  for (let i = 0; i < treeRecs.length; i++) for (let j = i + 1; j < treeRecs.length; j++)
+    if (Math.hypot(treeRecs[i].x - treeRecs[j].x, treeRecs[i].z - treeRecs[j].z) < 25) d6.treeTooClose++;
+  for (let i = 0; i < stoneCols.length; i++) for (let j = i + 1; j < stoneCols.length; j++)
+    if (Math.hypot(stoneCols[i].x - stoneCols[j].x, stoneCols[i].z - stoneCols[j].z) < stoneCols[i].r + stoneCols[j].r - 1e-9) d6.stoneOverlap++;
+  {
+    const meshes = window.__MOORS_STONEMESHES__ || [];
+    const stoneRecs = placements.filter(p => p.kind === 'standing-stone');
+    if (meshes.length !== 11) d6.stoneNotBuried = null;
+    for (const m of meshes) {
+      if (d6.stoneNotBuried === null) break;
+      let rec = null, bd = Infinity;
+      for (const r of stoneRecs) { const d = Math.hypot(m.position.x - r.x, m.position.z - r.z); if (d < bd) { bd = d; rec = r; } }
+      if (!rec) { d6.stoneNotBuried++; continue; }
+      const buried = rec.h * 0.15;
+      const expectedY = groundHeight(m.position.x, m.position.z) + (rec.h + buried) / 2 - buried;
+      if (Math.abs(m.position.y - expectedY) > 0.02) d6.stoneNotBuried++;
+    }
+  }
+  for (const p of (window.__MOORS_WALLRUNS__ || [])) {
+    for (const run of p.runs) {
+      for (let k = run.a; k < run.b; k++) {
+        const h1 = groundHeight(p.points[k][0], p.points[k][1]);
+        const h2 = groundHeight(p.points[k + 1][0], p.points[k + 1][1]);
+        if (Math.abs(h2 - h1) > 0.28 + 1e-9) d6.wallStepViolation++;
+      }
+    }
+  }
+  return {
+    ...d6,
+    rockInCorridor: dl5 ? dl5.rockInCorridor : null,
+    wallColliderExcess: window.__MOORS_WORLD__.wallColliderExcess,
+    colliderTotal: COLLIDERS.length,
+    spawnClearanceM: +clearance.toFixed(2),
+    entranceGapWidth,
+    rubbleInGapPassage,
+    detailCounts: window.__moors.detailCounts
+  };
+};
+const frameStamps = [];
+function updateDiagnostics(dt) {
+  const M = window.__moors;
+  M.ready = true;
+  M.playerPosition = { x: +player.x.toFixed(2), z: +player.z.toFixed(2) };
+  M.playerYawPitch = { yaw: +yaw.toFixed(3), pitch: +pitch.toFixed(3) };
+  M.audioStarted = audioStarted;
+  M.windActive = audioStarted && !!audioCtx;
+  const now = performance.now();
+  frameStamps.push(now);
+  while (frameStamps.length && frameStamps[0] < now - 1000) frameStamps.shift();
+  M.fps = frameStamps.length;
+  if (renderer.info && renderer.info.render) {
+    M.drawCalls = renderer.info.render.calls;
+    M.triangleCount = renderer.info.render.triangles;
+  }
+}
+
+
+// ---- SS7/P1 quality tiers: one-way automatic step-down ----
+// Decision input is a 3 s rolling FPS after a 2 s warmup (never the SS8
+// 1 s display fps). < 45 FPS sustained 3.0 s steps down one tier, at most
+// one step per 5 s, never back up. A transition touches only renderer
+// DPR, tuft draw count, and mist-bank visibility (P7 invariants).
+const TIERS = [
+  { dpr: Math.min(window.devicePixelRatio || 1, 1.5), tufts: 3800, mist: 16 },
+  { dpr: 1.0, tufts: 2200, mist: 10 },
+  { dpr: 0.85, tufts: 1400, mist: 6 }
+];
+let qualityTierIndex = /[?&]quality=low(&|$)/.test(location.search || '') ? 2 : 0;
+function applyTier() {
+  const T = TIERS[qualityTierIndex];
+  renderer.setPixelRatio(T.dpr);
+  if (window.__MOORS_TUFTS__) window.__MOORS_TUFTS__.count = T.tufts;
+  mistBanks.forEach((b, i) => { b.visible = mistRankPos[i] < T.mist; }); // AT7: top-N of the significance ranking
+  window.__moors.qualityTier = 'tier' + qualityTierIndex;
+}
+applyTier();
+const tierStamps = [];
+let tierElapsed = 0, tierBelowTime = 0, tierLastStep = -Infinity;
+function updateQualityTier(dt) {
+  tierElapsed += dt;
+  const now = performance.now();
+  tierStamps.push(now);
+  while (tierStamps.length && tierStamps[0] < now - 3000) tierStamps.shift();
+  if (tierElapsed < 2) return; // warmup
+  const fps3 = tierStamps.length / 3;
+  if (fps3 < 45) tierBelowTime += dt; else tierBelowTime = 0;
+  if (tierBelowTime >= 3.0 && tierElapsed - tierLastStep >= 5 && qualityTierIndex < 2) {
+    qualityTierIndex++;
+    tierLastStep = tierElapsed;
+    tierBelowTime = 0;
+    applyTier();
+  }
+}
+
+const clock = new THREE.Clock();
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.1);
+  const t = clock.elapsedTime;
+  skyGroup.position.copy(camera.position);
+  for (const m of mistBanks) {
+    m.position.x += m.userData.speed * dt; // westerly drift (SS3.5)
+    if (m.position.x > 300) {
+      const dx = m.position.x - player.x, dz = m.position.z - player.z;
+      if (dx * dx + dz * dz > 160 * 160) {
+        // SS3.5 wrap (rB8-gpt correction): a candidate commits ONLY with a
+        // valid footprint at its own location — never a new x/z with an old
+        // y. Bounded resampling; on failure the bank holds at the boundary
+        // (its current footprint stays valid) and retries on later frames.
+        let placed = false;
+        for (let att = 0; att < 8 && !placed; att++) {
+          const cx = m.position.x - 600;
+          const cz = att === 0 ? m.position.z : -280 + mistRng() * 560;
+          const y = mistFootprintY(cx, cz, m.userData.radius);
+          if (y !== null) { m.position.x = cx; m.position.z = cz; m.position.y = y; placed = true; }
+        }
+        if (!placed) m.position.x = 300;
+      }
+    }
+  }
+  if (locked || dragLook || TEST_MODE) stepMovement(Math.min(dt, 0.05));
+  else {
+    camera.position.set(player.x, groundHeight(player.x, player.z) + EYE, player.z);
+    camera.rotation.y = yaw; camera.rotation.x = pitch;
+    window.__MOORS_PLAYER__ = { x: +player.x.toFixed(2), z: +player.z.toFixed(2), yaw: +yaw.toFixed(3) };
+  }
+  syncAudioListener(); // AU2: listener follows the camera every frame
+  updateDiagnostics(dt); // SS8 live diagnostics
+  updateQualityTier(dt); // SS7/P1 tier step-down
+  renderer.render(scene, camera);
+}
+animate();
+</script>
+
+<script>
+// TEST DIAG VARIANT — DOM bridge for harness browsers without JS eval.
+// Renders window.__moors into the page and exposes the hooks as buttons.
+(function () {
+  var panel = document.createElement('div');
+  panel.id = 'diagPanel';
+  panel.style.cssText = 'position:fixed;top:8px;left:8px;z-index:9999;background:rgba(0,0,0,0.82);color:#cfe3ff;font:11px/1.45 monospace;padding:8px;max-width:46vw;white-space:pre-wrap;';
+  var out = document.createElement('div'); out.id = 'diagOut'; out.textContent = 'diag: waiting for game…';
+  var btns = document.createElement('div'); btns.style.cssText = 'margin-top:6px;display:flex;flex-wrap:wrap;gap:4px;';
+  function mk(label, fn) { var b = document.createElement('button'); b.textContent = label; b.id = 'diagBtn-' + label.replace(/[^A-Za-z0-9]+/g, '-'); b.style.cssText = 'font:11px monospace;padding:3px 6px;cursor:pointer;'; b.addEventListener('click', function () { try { fn(); } catch (e) { out.textContent = 'diag button error: ' + e.message; } refresh(); }); btns.appendChild(b); }
+  panel.appendChild(out); panel.appendChild(btns);
+  document.body.appendChild(panel);
+  var rendererStr = 'unknown';
+  try { var c = document.createElement('canvas'); var gl = c.getContext('webgl2') || c.getContext('webgl'); var ext = gl && gl.getExtension('WEBGL_debug_renderer_info'); if (gl) rendererStr = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER); } catch (e) {}
+  mk('POSE-SPAWN', function () { window.__moors.setPose(0, 0, 1.995, 0); });
+  mk('POSE-CIRCLE-VIEW', function () { window.__moors.setPose(33.75, -78.75, 1.995, 0); });
+  mk('POSE-IN-CIRCLE', function () { window.__moors.setPose(45, -105, 1.995, 0); });
+  mk('EV0-curlew', function () { out.textContent = 'triggerEvent(0) -> ' + window.__moors.triggerEvent(0); });
+  mk('EV1-drone', function () { out.textContent = 'triggerEvent(1) -> ' + window.__moors.triggerEvent(1); });
+  mk('EV2-creak', function () { out.textContent = 'triggerEvent(2) -> ' + window.__moors.triggerEvent(2); });
+  mk('EV3-bell', function () { out.textContent = 'triggerEvent(3) -> ' + window.__moors.triggerEvent(3); });
+  mk('EV4-call', function () { out.textContent = 'triggerEvent(4) -> ' + window.__moors.triggerEvent(4); });
+  function refresh() {
+    var M = window.__moors || {}; var W = window.__MOORS_WORLD__ || {};
+    var lines = [];
+    lines.push('DIAG VARIANT (RC c86c1af9 + DOM bridge; game code identical except test-mode overlay also starts audio)');
+    lines.push('seed=' + (W.seed !== undefined ? W.seed : M.seed) + ' fingerprint=' + (W.fingerprint || 'n/a') + ' version=' + M.version);
+    lines.push('renderer=' + rendererStr);
+    lines.push('ready=' + M.ready + ' fps=' + M.fps + ' drawCalls=' + M.drawCalls + ' triangles=' + M.triangleCount + ' tier=' + M.qualityTier);
+    lines.push('pos=' + JSON.stringify(M.playerPosition) + ' yawPitch=' + JSON.stringify(M.playerYawPitch));
+    lines.push('audioStarted=' + M.audioStarted + ' windActive=' + M.windActive);
+    lines.push('detailCounts=' + JSON.stringify(M.detailCounts));
+    lines.push('eventTypes=' + JSON.stringify(M.eventTypes));
+    try { lines.push('placementAudit=' + JSON.stringify(M.placementAudit())); } catch (e) { lines.push('placementAudit error: ' + e.message); }
+    lines.push('eventLog(last5)=' + JSON.stringify((M.eventLog || []).slice(-5)));
+    lines.push('errors=' + JSON.stringify((M.errors || []).slice(0, 5)) + ' count=' + (M.errors || []).length);
+    lines.push('viewport=' + window.innerWidth + 'x' + window.innerHeight + ' dpr=' + window.devicePixelRatio);
+    out.textContent = lines.join('\n');
+  }
+  setInterval(refresh, 500);
+  setTimeout(refresh, 1500);
+})();
+</script>
+</body>
+</html>
