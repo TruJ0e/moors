@@ -433,7 +433,7 @@ for (let i = 0; i < 16; i++) {
   m.position.set(x, y, z);
   m.rotation.set((mistRng() - 0.5) * 0.06, mistRng() * Math.PI, (mistRng() - 0.5) * 0.06); // tilt <= ~3 deg
   m.renderOrder = 2;
-  m.userData = { speed: 0.12 + mistRng() * 0.18, radius: size / 2 };
+  m.userData = { speed: 0.12 + mistRng() * 0.18, radius: size / 2, gx: x, gz: z }; // gx/gz: generation position (TEST T-2)
   mistBanks.push(m); scene.add(m);
 }
 // AT7: fixed significance ranking — all banks share opacity, so
@@ -1562,7 +1562,7 @@ window.__moors.placementAudit = () => {
     stoneNotBuried: 0,
     stoneOverlap: 0,
     wallStepViolation: 0,
-    mistInClearing: mistBanks.filter(b => Math.hypot(b.position.x, b.position.z) - b.userData.radius < 28).length,
+    mistInClearing: mistBanks.filter(b => Math.hypot(b.userData.gx, b.userData.gz) - b.userData.radius < 28).length, // D6 placement audit: generation positions (banks drift in play; TEST T-2)
     rockColliderExcess: Math.max(0, COLLIDERS.filter(c => c.kind === 'rock').length - 40),
   };
   for (let i = 0; i < treeRecs.length; i++) for (let j = i + 1; j < treeRecs.length; j++)
