@@ -9,7 +9,7 @@
   #app { position:fixed; inset:0; }
   canvas { display:block; }
   #overlay {
-    position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center;
     background:rgba(4,5,6,0.82); color:#9aa3a0; font-family:Georgia, 'Times New Roman', serif;
     letter-spacing:0.35em; text-transform:uppercase; font-size:15px; cursor:pointer;
     user-select:none; z-index:10; text-align:center;
@@ -1701,12 +1701,11 @@ animate();
 
 <script>
 // TEST DIAG VARIANT — DOM bridge for harness browsers without JS eval.
-// Renders window.__moors into the page and exposes the hooks as buttons.
 (function () {
   var panel = document.createElement('div');
   panel.id = 'diagPanel';
   panel.style.cssText = 'position:fixed;top:8px;left:8px;z-index:9999;background:rgba(0,0,0,0.82);color:#cfe3ff;font:11px/1.45 monospace;padding:8px;max-width:46vw;white-space:pre-wrap;';
-  var out = document.createElement('div'); out.id = 'diagOut'; out.textContent = 'diag: waiting for game…';
+  var out = document.createElement('div'); out.id = 'diagOut'; out.textContent = 'diag: waiting for game\u2026';
   var btns = document.createElement('div'); btns.style.cssText = 'margin-top:6px;display:flex;flex-wrap:wrap;gap:4px;';
   function mk(label, fn) { var b = document.createElement('button'); b.textContent = label; b.id = 'diagBtn-' + label.replace(/[^A-Za-z0-9]+/g, '-'); b.style.cssText = 'font:11px monospace;padding:3px 6px;cursor:pointer;'; b.addEventListener('click', function () { try { fn(); } catch (e) { out.textContent = 'diag button error: ' + e.message; } refresh(); }); btns.appendChild(b); }
   panel.appendChild(out); panel.appendChild(btns);
@@ -1714,6 +1713,7 @@ animate();
   var rendererStr = 'unknown';
   try { var c = document.createElement('canvas'); var gl = c.getContext('webgl2') || c.getContext('webgl'); var ext = gl && gl.getExtension('WEBGL_debug_renderer_info'); if (gl) rendererStr = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER); } catch (e) {}
   mk('POSE-SPAWN', function () { window.__moors.setPose(0, 0, 1.995, 0); });
+  mk('POSE-MOON', function () { window.__moors.setPose(0, 0, -0.611, 0.279); });
   mk('POSE-CIRCLE-VIEW', function () { window.__moors.setPose(33.75, -78.75, 1.995, 0); });
   mk('POSE-IN-CIRCLE', function () { window.__moors.setPose(45, -105, 1.995, 0); });
   mk('EV0-curlew', function () { out.textContent = 'triggerEvent(0) -> ' + window.__moors.triggerEvent(0); });
@@ -1724,7 +1724,7 @@ animate();
   function refresh() {
     var M = window.__moors || {}; var W = window.__MOORS_WORLD__ || {};
     var lines = [];
-    lines.push('DIAG VARIANT (RC c86c1af9 + DOM bridge; game code identical except test-mode overlay also starts audio)');
+    lines.push('DIAG VARIANT (DOM bridge; game code = current freeze)');
     lines.push('seed=' + (W.seed !== undefined ? W.seed : M.seed) + ' fingerprint=' + (W.fingerprint || 'n/a') + ' version=' + M.version);
     lines.push('renderer=' + rendererStr);
     lines.push('ready=' + M.ready + ' fps=' + M.fps + ' drawCalls=' + M.drawCalls + ' triangles=' + M.triangleCount + ' tier=' + M.qualityTier);
