@@ -1738,6 +1738,17 @@ animate();
     lines.push('viewport=' + window.innerWidth + 'x' + window.innerHeight + ' dpr=' + window.devicePixelRatio);
     out.textContent = lines.join('\n');
   }
+  var poseParam = /[?&]pose=(moon|circle|circleview|spawn)/.exec(location.search || '');
+  if (poseParam) {
+    var poses = { spawn: [0, 0, 1.995, 0], moon: [0, 0, -0.611, 0.279], circleview: [33.75, -78.75, 1.995, 0], circle: [45, -105, 1.995, 0] };
+    var pp = poses[poseParam[1]];
+    var tries = 0;
+    var iv = setInterval(function () {
+      tries++;
+      if (window.__moors && window.__moors.ready && window.__moors.setPose) { window.__moors.setPose(pp[0], pp[1], pp[2], pp[3]); clearInterval(iv); }
+      if (tries > 40) clearInterval(iv);
+    }, 500);
+  }
   setInterval(refresh, 500);
   setTimeout(refresh, 1500);
 })();
